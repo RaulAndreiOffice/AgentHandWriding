@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local configuration (copy .env.example)
+.env
+
+# Node helper for KaTeX validation (tools/package.json installs it)
+node_modules/
+
+# Evaluation outputs and caches
+scripts/.cache/
+scripts/out/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
