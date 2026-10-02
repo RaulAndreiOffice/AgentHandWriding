@@ -1,5 +1,8 @@
 """Side-by-side columns, figures and sign tables (segmenter + pipeline routing)."""
 
+import os
+
+import pytest
 from PIL import Image, ImageDraw, ImageFont
 
 from app.services.segmenter import SegmentationParams, segment_page
@@ -61,7 +64,128 @@ def sign_table() -> Image.Image:
     return img
 
 
+def law_of_sines() -> Image.Image:
+    """Triangle with apex A on the left, BC / sin A = 2R ... on the right. There is no
+    clear vertical gutter: the side AC slants under the formula column, and the apex
+    sits at the height of the first formula row."""
+    img = Image.new("RGB", (1500, 2000), "white")
+    d = ImageDraw.Draw(img)
+    d.text((80, 80), "6) In triunghiul ABC, BC = 6, A = 30", font=FONT, fill=INK)
+    a, b, c = (300, 235), (120, 520), (520, 520)
+    d.line([a, b, c, a], fill=INK, width=5)
+    for label, xy in (("A", (288, 185)), ("B", (82, 520)), ("C", (535, 520))):
+        d.text(xy, label, font=FONT, fill=INK)
+    d.text((450, 195), "BC", font=FONT, fill=INK)
+    d.line([(435, 245), (560, 245)], fill=INK, width=4)
+    d.text((440, 252), "sin A", font=FONT, fill=INK)
+    d.text((580, 225), "= 2R", font=FONT, fill=INK)
+    d.text((500, 330), "6", font=FONT, fill=INK)
+    d.line([(480, 378), (540, 378)], fill=INK, width=4)
+    d.text((490, 385), "1/2", font=FONT, fill=INK)
+    d.text((560, 358), "= 2R", font=FONT, fill=INK)
+    d.text((570, 450), "12 = 2R  =>  R = 6", font=FONT, fill=INK)
+    d.text((80, 650), "Raspuns: R = 6", font=FONT, fill=INK)
+    return img
+
+
+def flat_triangle_on_grid() -> Image.Image:
+    """The real failure: grid paper, a flat obtuse triangle (base 550, height 130, so
+    its base is long enough for the ruled-line filter), the apex label 'A' and an
+    angle arc '30°' touching the top, fractions on the right."""
+    from PIL import ImageFilter
+
+    img = Image.new("RGB", (1500, 2000), (246, 246, 240))
+    d = ImageDraw.Draw(img)
+    for x in range(0, 1500, 44):
+        d.line([(x, 0), (x, 2000)], fill=(130, 145, 170), width=2)
+    for y in range(0, 2000, 44):
+        d.line([(0, y), (1500, y)], fill=(130, 145, 170), width=2)
+    d.text((80, 80), "6) BC = 4, A = 30, B = 45", font=FONT, fill=INK)
+    a, b, c = (300, 300), (90, 430), (640, 430)
+    d.line([a, b, c, a], fill=INK, width=4)
+    d.text((285, 252), "A", font=FONT, fill=INK)
+    d.arc((262, 300, 338, 352), 25, 155, fill=INK, width=3)
+    d.text((285, 322), "30", font=ImageFont.load_default(size=30), fill=INK)
+    d.text((55, 425), "B", font=FONT, fill=INK)
+    d.text((650, 425), "C", font=FONT, fill=INK)
+    d.text((470, 228), "BC", font=FONT, fill=INK)
+    d.line([(455, 278), (575, 278)], fill=INK, width=4)
+    d.text((460, 284), "sin A", font=FONT, fill=INK)
+    d.text((590, 258), "=", font=FONT, fill=INK)
+    d.text((640, 228), "AC", font=FONT, fill=INK)
+    d.line([(625, 278), (745, 278)], fill=INK, width=4)
+    d.text((630, 284), "sin B", font=FONT, fill=INK)
+    d.text((720, 370), "4", font=FONT, fill=INK)
+    d.line([(700, 418), (760, 418)], fill=INK, width=4)
+    d.text((705, 425), "1/2", font=FONT, fill=INK)
+    d.text((775, 398), "= AC / (sqrt2/2)", font=FONT, fill=INK)
+    d.text((700, 500), "AC = 4 sqrt2", font=FONT, fill=INK)
+    d.text((80, 640), "Raspuns: AC = 4 sqrt2", font=FONT, fill=INK)
+    return img.filter(ImageFilter.GaussianBlur(0.6))
+
+
+def test_flat_triangle_on_grid_paper_with_apex_label_and_arc():
+    seg = segment_page(png_bytes(flat_triangle_on_grid()))
+    figs = [r for r in seg.regions if r.kind == "diagram"]
+    assert len(figs) == 1
+    fig = figs[0].bbox
+    assert fig.y <= 255 and fig.y1 >= 450 and fig.x <= 60 and fig.x1 >= 660   # A, the arc, B and C included
+    first = next(r for r in seg.regions if r.kind == "line" and 200 < r.bbox.y < 300)
+    assert first.bbox.x >= 440                                  # "BC / sin A" without the apex or 'A'
+    fractions = [r for r in seg.regions if r.kind == "line" and 340 < r.bbox.y < 480]
+    assert len(fractions) == 1 and fractions[0].bbox.x >= 680   # "4 / (1/2) = ..." without the triangle
+
+
+REAL_LAW_OF_SINES = os.environ.get(
+    "LAW_OF_SINES_IMAGE", r"C:\Users\raulb\Pictures\Screenshots\Captură de ecran 2026-10-01 204740.png")
+
+
+@pytest.mark.skipif(not os.path.exists(REAL_LAW_OF_SINES), reason="real screenshot not available (LAW_OF_SINES_IMAGE)")
+def test_real_law_of_sines_screenshot():
+    """The 595x741 screenshot that failed: grid paper, a flat triangle whose base is a
+    1-2 px pen stroke (as thin as the grid), a '2' written on side AC."""
+    seg = segment_page(open(REAL_LAW_OF_SINES, "rb").read())
+    figs = [r for r in seg.regions if r.kind == "diagram"]
+    assert len(figs) == 1
+    fig = figs[0].bbox
+    assert fig.x <= 60 and fig.x1 >= 230 and fig.y <= 70 and fig.y1 >= 150   # A to the base label 4, B to C
+    right = [r for r in seg.regions if r.kind == "line" and r.bbox.x >= 290 and r.bbox.y < 200]
+    assert len(right) == 3                                    # BC/sinA = AC/sinB | 4/(1/2) = ... | sin B = 1/4
+    assert all(r.bbox.x > fig.x1 - 10 for r in right[:1])     # the first fraction row holds no part of the triangle
+
+
 # ---- segmenter -----------------------------------------------------------------------
+
+def test_figure_without_gutter_is_one_region_and_formulas_stay_separate():
+    seg = segment_page(png_bytes(law_of_sines()))
+    figs = [r for r in seg.regions if r.kind == "diagram"]
+    assert len(figs) == 1
+    fig = figs[0].bbox
+    assert fig.y <= 190 and fig.y1 >= 540 and fig.x <= 90 and fig.x1 >= 560  # apex A to base, B to C, labels
+    formulas = [r for r in seg.regions if r.kind == "line" and 150 < r.bbox.y < 600]
+    assert len(formulas) == 3                                   # BC/sin A, 6/(1/2), 12 = 2R
+    assert [r.index for r in formulas] == sorted(r.index for r in formulas)
+    assert all(r.index > figs[0].index for r in formulas)      # figure first, then its calculations
+    first = formulas[0].bbox
+    assert first.x >= 400 and first.y1 < 320                    # BC/sin A without the apex of the triangle
+
+
+def test_figure_crop_shows_only_the_figure():
+    import io
+
+    import numpy as np
+
+    seg = segment_page(png_bytes(law_of_sines()))
+    fig = next(r for r in seg.regions if r.kind == "diagram")
+    crop = np.asarray(Image.open(io.BytesIO(fig.image_bytes)).convert("L")).astype(int)
+    sx, sy = crop.shape[1] / fig.bbox.w, crop.shape[0] / fig.bbox.h
+    # "BC" of the first fraction lies inside the figure's bounding box but is blanked
+    x0, x1 = int((450 - fig.bbox.x) * sx), int((500 - fig.bbox.x) * sx)
+    y0, y1 = int((200 - fig.bbox.y) * sy), int((235 - fig.bbox.y) * sy)
+    assert crop[y0:y1, x0:x1].min() > 200
+    # while the side AB is kept
+    ax, ay = int((210 - fig.bbox.x) * sx), int((377 - fig.bbox.y) * sy)
+    assert crop[ay - 6:ay + 6, ax - 6:ax + 6].min() < 120
 
 def test_figure_and_formulas_become_separate_regions_in_reading_order():
     seg = segment_page(png_bytes(figure_beside_formulas()))
