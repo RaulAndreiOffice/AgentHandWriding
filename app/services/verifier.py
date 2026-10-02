@@ -96,6 +96,11 @@ _T_VARIABLE = re.compile(
     r"not[ăa]m|notez"
     r"|(?<![\\A-Za-z])t\s*=\s*[^=]*x|(?<![\\A-Za-z])t\s*(?:>|\\geq?|\\in)\s*0"
     r"|(?<![\\A-Za-z])t\s*[\^_]|(?<![\\A-Za-z])[a-z]\(\s*t\s*\)|\d\s*t(?![A-Za-z])")
+#: A calculus page: derivatives, limits, logarithms, integrals, monotony, asymptotes.
+_CALCULUS = re.compile(r"[a-z]\s*'|\\prime|\\lim|\\ln|\\int|\\to(?![A-Za-z])|deriv|asimpt|monoton|cresc|\\infty|∞",
+                       re.IGNORECASE)
+#: Asymptotes or infinity on the page: "x -> 50" there is a misread "x -> infinity".
+_ASYMPTOTE = re.compile(r"asimpt|\\infty|∞", re.IGNORECASE)
 
 
 @dataclass
@@ -104,6 +109,12 @@ class PageContext:
     func_args: dict[str, set[str]]
     #: the page itself uses t as a variable (substitution "notăm t = 2^x", "t > 0")
     t_is_variable: bool
+    #: derivatives, limits, ln ... on the page: "e^n x" there is a misread "ln x"
+    calculus: bool = False
+    #: the page writes \ln itself (evidence for e^n x -> ln x)
+    has_ln: bool = False
+    #: asymptotes or infinity on the page (evidence for x -> 50 being x -> infinity)
+    asymptotes: bool = False
 
     @classmethod
     def from_texts(cls, texts: list[str]) -> PageContext:
@@ -111,7 +122,9 @@ class PageContext:
         args: dict[str, set[str]] = {}
         for name, sign, arg in _FUNC_ARG.findall(joined):
             args.setdefault(name, set()).add(sign + arg)
-        return cls(args, bool(_T_VARIABLE.search(joined)))
+        return cls(args, bool(_T_VARIABLE.search(joined)), calculus=bool(_CALCULUS.search(joined)),
+                   has_ln=bool(re.search(r"\\ln(?![A-Za-z])", joined)),
+                   asymptotes=bool(_ASYMPTOTE.search(joined)))
 
 
 # ------------------------------------------------------------ math detection
@@ -223,7 +236,7 @@ UNICODE_MATH = {
     "⇒": r"\Rightarrow ", "⇔": r"\Leftrightarrow ", "→": r"\to ", "·": r"\cdot ", "×": r"\times ",
     "±": r"\pm ", "∪": r"\cup ", "∩": r"\cap ", "∀": r"\forall ", "∃": r"\exists ", "ℝ": r"\mathbb{R}",
     "Δ": r"\Delta ", "π": r"\pi ", "°": r"^\circ ", "²": "^{2}", "³": "^{3}", "⁴": "^{4}", "⁵": "^{5}",
-    "√": r"\sqrt ", "ℓ": r"\ell ",
+    "√": r"\sqrt ", "ℓ": r"\ell ", "↗": r"\nearrow ", "↘": r"\searrow ", "↑": r"\uparrow ", "↓": r"\downarrow ",
 }
 
 #: (pattern, replacement, issue kind, message, content?)
@@ -300,6 +313,89 @@ def _decide(issues: list[Issue], decisions: dict[str, str], *, kind: str, key: s
     return default
 
 
+#: An exponent (braced, a command, or one character) followed by primes: ")^{-5}'".
+_POWER_PRIME = re.compile(r"\^\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}|\\[A-Za-z]+|[^\s{}\\'])\s*('+)")
+_CLOSE_OPEN = {")": "(", "]": "[", "}": "{"}
+
+
+def _base_start(tex: str, end: int) -> int | None:
+    """Start of the base whose exponent begins at `end` (the '^'): a bracketed group
+    (with its \\left), a braced group, a command, or a run of letters/digits."""
+    i = end
+    while i > 0 and tex[i - 1] == " ":
+        i -= 1
+    if i == 0:
+        return None
+    ch = tex[i - 1]
+    if ch in _CLOSE_OPEN:
+        depth, j = 0, i - 1
+        while j >= 0:
+            if tex[j] == ch and (j == 0 or tex[j - 1] != "\\"):
+                depth += 1
+            elif tex[j] == _CLOSE_OPEN[ch] and (j == 0 or tex[j - 1] != "\\"):
+                depth -= 1
+                if depth == 0:
+                    break
+            j -= 1
+        if j < 0:
+            return None
+        return j - 5 if tex[max(0, j - 5):j] == "\\left" else j
+    m = re.search(r"(\\[A-Za-z]+|[A-Za-z0-9]+)$", tex[:i])
+    return m.start() if m else None
+
+
+def fix_power_prime(tex: str, issues: list[Issue]) -> str:
+    """A prime after an exponent is a second superscript (KaTeX: "Double superscript").
+    After a bracketed base the prime goes on the bracket: (e^{n}\\cdot x)^{-5}' ->
+    (e^{n}\\cdot x)'^{-5} - the derivative of the bracket, as the student writes
+    (...)' and the model pulls a following term into the exponent. After a plain base
+    the whole power is derived: x^{2}' -> (x^{2})'."""
+    for _ in range(10):
+        m = _POWER_PRIME.search(tex)
+        if not m:
+            return tex
+        start = _base_start(tex, m.start())
+        if start is None:
+            return tex
+        base = tex[start:m.start()].rstrip()
+        if base[-1] in ")]" or base.endswith("\\right)") or base.endswith("\\right]"):
+            fixed = f"{base}{m.group(2)}^{m.group(1)}"
+        else:
+            fixed = f"({base}^{m.group(1)}){m.group(2)}"
+        issues.append(Issue("double_superscript", f"prime after an exponent moved onto the base: "
+                                                  f"{tex[start:m.end()]} -> {fixed}", fixed=True))
+        tex = tex[:start] + fixed + tex[m.end():]
+    return tex
+
+
+#: "ln x" read as "e^n x" / "e^{n} \cdot x" (the l as e, the n raised).
+_E_N_X = re.compile(r"(?<![A-Za-z\\])e\s*\^\s*(?:\{\s*n\s*\}|n)\s*(?:\\cdot\s*)?(?=x(?![A-Za-z]))")
+#: "x -> infinity" read as "x -> 50": the infinity sign as a 5 and an o.
+_TO_FIFTY = re.compile(r"(\\to|\\rightarrow|->)\s*([+-]?)\s*(?:50|5o|5O|S0)(?![0-9.,])")
+_VERTICAL_ARROWS = {r"\downarrow": r"\searrow", r"\Downarrow": r"\searrow", r"\uparrow": r"\nearrow",
+                    r"\Uparrow": r"\nearrow"}
+_DERIVATIVE_ROW = re.compile(r"[A-Za-z]\s*(?:'|\\prime|\^\s*\{\s*\\prime)")
+
+
+def fix_table_arrows(tex: str, issues: list[Issue]) -> str:
+    """In a sign table, the monotony row (f(x)) shows a function going down or up:
+    \\downarrow -> \\searrow, \\uparrow -> \\nearrow. Rows of a derivative (f'(x)) are left alone."""
+    rows = re.split(r"(\\\\|\n)", tex)
+    changed = False
+    for k in range(0, len(rows), 2):
+        row = rows[k]
+        label = row.split("&", 1)[0]
+        if _DERIVATIVE_ROW.search(label):
+            continue
+        new = re.sub(r"\\(?:down|Down|up|Up)arrow(?![A-Za-z])", lambda m: _VERTICAL_ARROWS[m.group(0)], row)
+        changed |= new != row
+        rows[k] = new
+    if changed:
+        issues.append(Issue("table_arrows", "vertical arrows in the f(x) row written as \\searrow / \\nearrow",
+                            fixed=True, content=False))
+    return "".join(rows)
+
+
 def fix_math(tex: str, ctx: PageContext, issues: list[Issue], decisions: dict[str, str] | None = None) -> str:
     """Formatting fixes and content corrections inside one math segment.
 
@@ -316,6 +412,29 @@ def fix_math(tex: str, ctx: PageContext, issues: list[Issue], decisions: dict[st
     tex = re.sub(r"\^\{(\d)\}\^\{(\d)\}", r"^{\1\2}", tex)
     if tex != before:
         issues.append(Issue("unicode", "unicode math symbols converted to LaTeX", fixed=True, content=False))
+    tex = fix_power_prime(tex, issues)
+
+    # "ln x" read as "e^n x": on a calculus page there is no exponent n.
+    m = _E_N_X.search(tex)
+    if m:
+        chosen = _decide(issues, decisions, kind="ln", key="en_vs_ln", choices=("ln", m.group(0).strip()),
+                         default="ln" if ctx.calculus else None, strong=ctx.has_ln,
+                         context=_snippet(tex, m.start(), m.end() + 1),
+                         message=f"'{m.group(0).strip()} x' read as \\ln x" if ctx.calculus
+                         else f"'{m.group(0).strip()} x' may be \\ln x")
+        if chosen == "ln":
+            tex = _E_N_X.sub(r"\\ln ", tex)
+
+    # "x -> infinity" read as "x -> 50" (limits of rational functions, asymptotes).
+    m = _TO_FIFTY.search(tex)
+    if m:
+        likely = ctx.asymptotes or "\\frac" in tex or "\\infty" in tex
+        chosen = _decide(issues, decisions, kind="infinity", key="50_vs_inf", choices=("∞", "50"),
+                         default="∞" if likely else None, context=_snippet(tex, m.start(), m.end()),
+                         message=f"'{m.group(0).strip()}' read as a limit to infinity" if likely
+                         else f"'{m.group(0).strip()}': 50 may be a misread infinity")
+        if chosen == "∞":
+            tex = _TO_FIFTY.sub(lambda mm: f"{mm.group(1)} {mm.group(2)}\\infty", tex)
 
     def to_env(m: re.Match) -> str:
         env = {"(": "pmatrix", "|": "vmatrix", "[": "bmatrix"}[m.group(1)]
@@ -561,20 +680,23 @@ def _collapse_display_blocks(text: str) -> str:
 
 def verify_page(texts: list[str], errors: list[str | None] | None = None,
                 checker: KatexChecker | None = None,
-                decisions: list[dict[str, str] | None] | None = None) -> list[VerifiedLine]:
+                decisions: list[dict[str, str] | None] | None = None,
+                kinds: list[str] | None = None) -> list[VerifiedLine]:
     """Verify and correct every region of one page (same order as texts).
 
     `decisions[i]` (optional) holds re-ask answers for region i, keyed like Issue.key;
-    they override the verifier's own choice at those decision points.
+    they override the verifier's own choice at those decision points. `kinds[i]` is the
+    region's kind from segmentation ("table" gets the monotony-arrow rule).
     """
     errors = errors or [None] * len(texts)
     decisions = decisions or [None] * len(texts)
+    kinds = kinds or ["line"] * len(texts)
     ctx = PageContext.from_texts([t for t, e in zip(texts, errors) if not e])
     checker = checker if checker is not None else get_katex_checker()
 
     results: list[VerifiedLine] = []
     pending: list[tuple[int, str, bool]] = []  # (result index, tex, display) for KaTeX
-    for text, error, decided in zip(texts, errors, decisions):
+    for text, error, decided, kind in zip(texts, errors, decisions, kinds):
         if error:
             results.append(VerifiedLine("", "grey", [Issue("vlm_error", error)]))
             continue
@@ -589,6 +711,9 @@ def verify_page(texts: list[str], errors: list[str | None] | None = None,
         issues: list[Issue] = []
         lines = [_fix_line(ln.strip(), ctx, issues, decided or {}) for ln in text.splitlines() if ln.strip()]
         latex = "\n".join(lines)
+        if kind == "table":
+            latex = fix_table_arrows(latex, issues)
+            lines = latex.split("\n")
         for ln in lines:
             for kind, content in split_segments(ln)[0]:
                 if kind != "text":

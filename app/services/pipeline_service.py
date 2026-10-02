@@ -162,7 +162,8 @@ class TranscriptionPipeline:
             line.raw_latex = line.source_latex = line.latex
         if not self.settings.verify_transcriptions:
             return lines
-        results = await asyncio.to_thread(verify_page, [l.latex for l in lines], [l.error for l in lines])
+        results = await asyncio.to_thread(verify_page, [l.latex for l in lines], [l.error for l in lines],
+                                          None, None, [l.kind for l in lines])
         for line, res in zip(lines, results):
             if line.kind == "diagram":  # a placeholder by design: nothing to correct
                 line.status = "green"
@@ -179,8 +180,10 @@ class TranscriptionPipeline:
         if all(line.status == "green" for line in lines):
             return
 
+        kinds = [line.kind for line in lines]
+
         async def verify(texts, errors, decisions):
-            return await asyncio.to_thread(verify_page, texts, errors, None, decisions)
+            return await asyncio.to_thread(verify_page, texts, errors, None, decisions, kinds)
 
         await Reasker(self.vlm, self.settings).run(lines, crops, verify)
 

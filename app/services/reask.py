@@ -8,7 +8,8 @@ costs no extra VLM calls:
      output schema and a description of what went wrong. The new text is kept
      only if the verifier rates it better than the old one.
   2. Closed questions. For every open ambiguity on a yellow line (A(s) vs
-     A(5), a misread arrow, o vs ∘, the grade mark) the line crop is sent with
+     A(5), a misread arrow, o vs ∘, the grade mark, e^n x vs ln x, x -> 50 vs
+     x -> infinity) the line crop is sent with
      one multiple-choice question. Only the text of the answer is used (no
      logprobs: they crash vLLM under WSL). An answer is used when it is one of
      the options and either decides a flag the verifier left open or confirms
@@ -103,6 +104,16 @@ def build_question(issue: Issue) -> Question | None:
             f"'o'. Is it A: the composition operator ∘ (a small raised circle), or B: the letter o? "
             f"Answer A or B.",
             {"A": "∘", "B": "o"})
+    if key == "en_vs_ln":
+        return Question(
+            f"This handwritten line was read as: {ctx}. Look at the part read as 'e^n x'. Is it "
+            f"A: the natural logarithm ln x, or B: e to the power n, times x? Answer A or B.",
+            {"A": "ln", "B": issue.choices[-1]})
+    if key == "50_vs_inf":
+        return Question(
+            f"This handwritten line was read as: {ctx}. Look at what x tends to, read as '50'. Is it "
+            f"A: infinity ∞ (a sideways 8), or B: the number 50? Answer A or B.",
+            {"A": "∞", "B": "50"})
     if key == "grade_mark":
         return Question(
             "Look at the end of this handwritten line. Is there the mark „A” (a capital A, usually "

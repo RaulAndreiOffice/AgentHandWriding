@@ -224,6 +224,62 @@ def test_sign_table_is_tagged():
     assert table.bbox.h > 200                                 # all three rows in one crop
 
 
+def sign_table_with_conclusions() -> Image.Image:
+    """Subiectul 3 layout: a variation table whose rules span ~42% of the page (as long
+    as a grid line piece), the f(x) row closed by a bottom rule, and the monotony
+    read off the table written in four lines on its right."""
+    img = Image.new("RGB", (1500, 2000), "white")
+    d = ImageDraw.Draw(img)
+    d.text((80, 60), "b) f'(x) = 0 <=> x = 4", font=FONT, fill=INK)
+    top, left, width = 220, 60, 630
+    for y in (top + 70, top + 150, top + 235):                 # under x, under f'(x), closing f(x)
+        d.line([(left, y), (left + width, y + 4)], fill=INK, width=3)
+    d.line([(left + 150, top - 5), (left + 152, top + 235)], fill=INK, width=3)
+    for x, text in ((left + 30, "x"), (left + 180, "0"), (left + 360, "4"), (left + 540, "+oo")):
+        d.text((x, top + 10), text, font=FONT, fill=INK)
+    for x, text in ((left, "f'(x)"), (left + 230, "-"), (left + 360, "0"), (left + 480, "+"), (left + 560, "+")):
+        d.text((x, top + 90), text, font=FONT, fill=INK)
+    d.text((left + 10, top + 170), "f(x)", font=FONT, fill=INK)
+    d.line([(left + 200, top + 180), (left + 320, top + 215)], fill=INK, width=3)
+    d.line([(left + 400, top + 215), (left + 600, top + 180)], fill=INK, width=3)
+    for k, text in enumerate(["f'(x) <= 0 pt. x in (0,4] =>", "=> f(x) descrescatoare pe (0,4]",
+                              "f'(x) >= 0 pt. x in [4,oo) =>", "=> f(x) crescatoare pe [4,oo)"]):
+        d.text((780, top - 10 + 62 * k), text, font=FONT, fill=INK)
+    d.text((80, 620), "c) Cautam asimptota orizontala", font=FONT, fill=INK)
+    return img
+
+
+def test_whole_sign_table_is_one_region_and_text_beside_it_separate_lines():
+    seg = segment_page(png_bytes(sign_table_with_conclusions()))
+    tables = [r for r in seg.regions if r.kind == "table"]
+    assert len(tables) == 1
+    t = tables[0].bbox
+    assert t.y <= 225 and t.y1 >= 450 and t.x <= 65 and t.x1 >= 680   # x, f'(x) and f(x) rows, +oo column
+    assert not [r for r in seg.regions if r.kind == "line" and r.bbox.x < t.x1 and t.y < r.bbox.y < t.y1]
+    right = [r for r in seg.regions if r.kind == "line" and r.bbox.x >= 700 and r.bbox.y < 500]
+    assert len(right) == 4                                     # one region per conclusion line
+    assert all(a.bbox.y1 <= b.bbox.y for a, b in zip(right, right[1:]))   # no overlap
+    assert tables[0].index < min(r.index for r in right)      # table first, then what is read off it
+
+
+REAL_SIGN_TABLE = os.environ.get(
+    "SIGN_TABLE_IMAGE", r"C:\Users\raulb\Pictures\Screenshots\Captură de ecran 2026-10-02 112016.png")
+
+
+@pytest.mark.skipif(not os.path.exists(REAL_SIGN_TABLE), reason="real screenshot not available (SIGN_TABLE_IMAGE)")
+def test_real_sign_table_screenshot():
+    """The 713x823 screenshot (Subiectul 3): the f(x) row was cut off the table at
+    the rule under f'(x), and the four lines on the right overlapped."""
+    seg = segment_page(open(REAL_SIGN_TABLE, "rb").read())
+    tables = [r for r in seg.regions if r.kind == "table"]
+    assert len(tables) == 1
+    t = tables[0].bbox
+    assert t.y <= 405 and t.y1 >= 510 and t.x <= 20 and t.x1 >= 320   # header to the bottom rule, +oo included
+    right = [r for r in seg.regions if r.kind == "line" and r.bbox.x >= 370 and 380 < r.bbox.y < 530]
+    assert len(right) == 4
+    assert all(a.bbox.y1 <= b.bbox.y for a, b in zip(right, right[1:]))
+
+
 # ---- pipeline routing ------------------------------------------------------------------
 
 def post(client, img):

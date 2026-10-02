@@ -58,6 +58,9 @@ CROP_MAX_UPSCALE = 2.5
 #: Near the photo border, ink on a background darker than this share of the
 #: paper brightness is off the page (desk, fold shadow, the next sheet).
 PAPER_SHADE = 0.8
+#: For table detection, a horizontal (vertical) line is notebook grid only when its row
+#: (column) carries line runs over this fraction of the page.
+TABLE_GRID_SPAN = 0.7
 
 
 @dataclass(frozen=True)
@@ -311,9 +314,42 @@ def _blobs(ink: np.ndarray, glyph: float) -> list[_Comp]:
     h, w = ink.shape
     k = max(3, int(glyph * 0.5))
     closed = cv2.morphologyEx(ink.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((1, k), np.uint8))
-    _, comps = _components(closed)
-    return [c for c in comps
-            if not (c.w > 0.5 * w and c.h > 4 * glyph) and not (c.h > 0.25 * h and c.w > 4 * glyph)]
+    labels, comps = _components(closed)
+    out = []
+    for i, c in enumerate(comps, start=1):
+        if (c.w > 0.5 * w and c.h > 4 * glyph) or (c.h > 0.25 * h and c.w > 4 * glyph):
+            continue
+        out += _split_touching(labels[c.y0:c.y1, c.x0:c.x1] == i, c, glyph)
+    return out
+
+
+def _split_touching(mask: np.ndarray, c: _Comp, glyph: float) -> list[_Comp]:
+    """Two lines whose words touch (a descender on an ascender) come out as one wide,
+    tall blob, which would merge the lines. Cut it at its thinnest row in the middle
+    when that row carries only a stroke or two - unless a long horizontal run (a
+    fraction bar) crosses the middle: a fraction is one blob by design."""
+    if c.h < 2.2 * glyph or c.w < 4 * glyph:
+        return [c]
+    rows = mask.sum(axis=1)
+    lo, hi = int(0.3 * c.h), int(0.7 * c.h)
+    bar = cv2.morphologyEx(mask[lo:hi].astype(np.uint8), cv2.MORPH_OPEN,
+                           np.ones((1, max(3, int(0.5 * c.w))), np.uint8))
+    if bar.any():
+        return [c]
+    cut = lo + int(np.argmin(rows[lo:hi]))
+    if rows[cut] > max(3, 0.25 * glyph):
+        return [c]
+    parts = []
+    for y0, part in ((0, mask[:cut]), (cut + 1, mask[cut + 1:])):
+        ys, xs = np.nonzero(part)
+        if not len(ys):
+            continue
+        sub = _Comp(c.x0 + int(xs.min()), c.y0 + y0 + int(ys.min()), c.x0 + int(xs.max()) + 1,
+                    c.y0 + y0 + int(ys.max()) + 1, int(len(ys)))
+        parts.append((sub, part[ys.min():ys.max() + 1, xs.min():xs.max() + 1]))
+    if len(parts) < 2 or min(p.h for p, _ in parts) < 0.8 * glyph:
+        return [c]
+    return [q for p, m in parts for q in _split_touching(m, p, glyph)]
 
 
 def _overlap(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -724,7 +760,7 @@ def _crossing(segs: list[tuple[int, int, int, int]], glyph: float) -> bool:
     return False
 
 
-def _figure_ink(full: np.ndarray, glyph: float) -> np.ndarray:
+def _figure_ink(full: np.ndarray, glyph: float, span: float = 0.4) -> np.ndarray:
     """Ink for finding figures: everything before the long-line filter (that filter
     also removes a flat triangle's long base), minus the notebook grid.
 
@@ -740,8 +776,8 @@ def _figure_ink(full: np.ndarray, glyph: float) -> np.ndarray:
     run = max(int(2 * glyph), 20)
     horiz = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((1, run), np.uint8)).astype(bool)
     vert = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((run, 1), np.uint8)).astype(bool)
-    grid_rows = horiz.sum(axis=1) >= 0.4 * w
-    grid_cols = vert.sum(axis=0) >= 0.4 * h
+    grid_rows = horiz.sum(axis=1) >= span * w
+    grid_cols = vert.sum(axis=0) >= span * h
     grid_rows = np.convolve(grid_rows, np.ones(5), mode="same") > 0
     grid_cols = np.convolve(grid_cols, np.ones(5), mode="same") > 0
     grid = (horiz & grid_rows[:, None]) | (vert & grid_cols[None, :])
@@ -835,6 +871,173 @@ def _find_figures(ink: np.ndarray, glyph: float) -> list[_Figure]:
     return figures
 
 
+def _horizontal_runs(ink: np.ndarray, glyph: float) -> list[tuple[float, float, float, float]]:
+    """Horizontal strokes at least 2.5 glyphs long, as end points, following a rule
+    that bows (Hough sees only short chords of it): over 2 glyphs a hand-drawn rule
+    drifts by a pixel or two, which a 3 px vertical dilation absorbs."""
+    run = max(3, int(2 * glyph))
+    tall = cv2.dilate(ink.astype(np.uint8), np.ones((3, 1), np.uint8))
+    rules = cv2.morphologyEx(tall, cv2.MORPH_OPEN, np.ones((1, run), np.uint8))
+    labels, comps = _components(rules.astype(bool))
+    out = []
+    end = max(2, int(0.5 * glyph))
+    for i, c in enumerate(comps, start=1):
+        if c.w < 2.5 * glyph or c.h > 0.18 * c.w + 3:
+            continue
+        sub = labels[c.y0:c.y1, c.x0:c.x1] == i
+        ys = np.arange(c.y0, c.y1)[:, None]
+        left, right = sub[:, :end], sub[:, -end:]
+        out.append((float(c.x0), float((ys * left).sum() / max(1, left.sum())),
+                    float(c.x1 - 1), float((ys * right).sum() / max(1, right.sum()))))
+    return out
+
+
+def _find_tables(ink: np.ndarray, glyph: float) -> list[_Comp]:
+    """Sign/variation tables on the page, found from their rules before the text is
+    clustered, so every row (x, f'(x), f(x) with its arrows) stays in one region
+    instead of being cut at the internal horizontal rules.
+
+    A table is a group of long horizontal rules (>= 5 glyphs) and vertical rules
+    (>= 2.5 glyphs) touching each other, at least one pair crossing (the "+" of
+    every such table, as in _is_table). Its box spans all the rules: the vertical
+    rule runs from the header row to the last row, the bottom rule closes it.
+    """
+    segs = _segments(ink, int(2 * glyph), glyph)
+    # Rules as end points: horizontal ones left to right, vertical ones top to bottom.
+    # A photographed rule tilts by a few degrees, so heights are read where they matter.
+    horiz: list[tuple[float, float, float, float]] = []
+    vert: list[tuple[float, float, float, float]] = []
+    for x0, y0, x1, y1 in segs:
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        if dx >= 2.5 * glyph and dy <= 0.18 * dx:  # pieces; long enough once joined
+            horiz.append((x0, y0, x1, y1) if x0 <= x1 else (x1, y1, x0, y0))
+        elif 2.5 * glyph <= dy <= 0.4 * ink.shape[0] and dx <= 0.18 * dy:  # not a margin line
+            vert.append((x0, y0, x1, y1) if y0 <= y1 else (x1, y1, x0, y0))
+    horiz += _horizontal_runs(ink, glyph)
+    if not horiz or not vert:
+        return []
+
+    def y_at(r, x: float) -> float:
+        x0, y0, x1, y1 = r
+        t = 0.0 if x1 == x0 else min(1.0, max(0.0, (x - x0) / (x1 - x0)))
+        return y0 + t * (y1 - y0)
+
+    def x_at(r, y: float) -> float:
+        x0, y0, x1, y1 = r
+        t = 0.0 if y1 == y0 else min(1.0, max(0.0, (y - y0) / (y1 - y0)))
+        return x0 + t * (x1 - x0)
+
+    # A hand-drawn rule comes out of Hough in pieces (broken where it bends or where
+    # the pen lifted, duplicated where it is thick): join pieces that continue each
+    # other - at most 3 glyphs apart, at the same height where they meet.
+    joined = True
+    while joined:
+        joined = False
+        horiz.sort(key=lambda r: r[0])
+        for i, q in enumerate(horiz):
+            for k in range(i + 1, len(horiz)):
+                r = horiz[k]
+                gap = r[0] - q[2]
+                if gap > 3 * glyph:
+                    continue
+                x = (r[0] + min(q[2], r[2])) / 2 if gap < 0 else None
+                dy = abs(y_at(q, x) - y_at(r, x)) if x is not None else abs(q[3] - r[1])
+                if dy <= 0.5 * glyph:
+                    left = q if q[0] <= r[0] else r
+                    right = q if q[2] >= r[2] else r
+                    horiz[i] = (left[0], left[1], right[2], right[3])
+                    del horiz[k]
+                    joined = True
+                    break
+            if joined:
+                break
+    horiz = [r for r in horiz if r[2] - r[0] >= 5 * glyph]
+    if not horiz:
+        return []
+
+    m = 0.7 * glyph
+    rules = [("h", r) for r in horiz] + [("v", r) for r in vert]
+    uf = _UnionFind(len(rules))
+    crossing: set[int] = set()
+    for i, h_ in enumerate(horiz):
+        for j, v in enumerate(vert, start=len(horiz)):
+            hy = y_at(h_, (v[0] + v[2]) / 2)
+            vx = x_at(v, hy)
+            if h_[0] - m <= vx <= h_[2] + m and v[1] - m <= hy <= v[3] + m:  # touch
+                uf.union(i, j)
+                if h_[0] + m <= vx <= h_[2] - m and v[1] + m <= hy <= v[3] - m:  # cross
+                    crossing.add(i)
+    # Pieces of one vertical rule (Hough breaks it where the horizontal rules cross).
+    for a, va in enumerate(vert, start=len(horiz)):
+        for b, vb in enumerate(vert[a - len(horiz) + 1:], start=a + 1):
+            if vb[1] - va[3] <= glyph and va[1] - vb[3] <= glyph:
+                y = (max(va[1], vb[1]) + min(va[3], vb[3])) / 2
+                if abs(x_at(va, y) - x_at(vb, y)) <= m:
+                    uf.union(a, b)
+    groups: dict[int, list[int]] = {}
+    for i in range(len(rules)):
+        groups.setdefault(uf.find(i), []).append(i)
+
+    tables = []
+    for members in groups.values():
+        if not crossing & set(members) or not any(rules[i][0] == "v" for i in members):
+            continue
+        xs = [p for i in members for p in (rules[i][1][0], rules[i][1][2])]
+        ys = [p for i in members for p in (rules[i][1][1], rules[i][1][3])]
+        box = _Comp(int(min(xs)), int(min(ys)), int(max(xs)) + 1, int(max(ys)) + 1, 0)
+        # Two row rules on one vertical rule, or the "+" test on the box (a bowed
+        # rule can defeat the latter, which re-fits straight lines).
+        rows = sum(rules[i][0] == "h" for i in members)
+        if box.w < 0.9 * ink.shape[1] and box.h >= 1.5 * glyph and (
+                rows >= 2 or _is_table(ink[box.y0:box.y1, box.x0:box.x1], glyph)):
+            tables.append(box)
+    return tables
+
+
+def _take_table_ink(blobs: list[_Comp], tables: list[_Comp], glyph: float) -> tuple[list[_Comp], list[_Comp]]:
+    """Give each table the writing inside its rules (row labels, values, arrows, what
+    is left of the rules themselves) and grow its box to cover it; return the
+    tables and the blobs that remain text."""
+    if not tables:
+        return tables, blobs
+    owned: list[list[_Comp]] = [[t] for t in tables]
+    text = []
+    pad = 0.3 * glyph
+    head = 0.8 * glyph  # the header row (x | 0 4 +inf) may sit a little above the vertical rule
+    for b in blobs:
+        cx, cy = (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2
+        for k, t in enumerate(tables):
+            # Mostly inside: the centre within the rules, or most of the blob's area.
+            shared = max(0, _overlap(t.x0, t.x1, b.x0, b.x1)) * max(0, _overlap(t.y0, t.y1, b.y0, b.y1))
+            inside = (t.x0 - pad <= cx <= t.x1 + pad and t.y0 - head <= cy <= t.y1 + pad) or shared >= 0.6 * b.w * b.h
+            if inside:
+                owned[k].append(b)
+                break
+        else:
+            text.append(b)
+    tables = [_union_box(o) for o in owned]
+    # Rules fade out before the last column: signs and values (small blobs) in the
+    # table's rows, at most 2.5 glyphs beyond its side, still belong to it. Text
+    # written beside a table starts further away.
+    grown = True
+    while grown:
+        grown = False
+        for b in text:
+            cy = (b.y0 + b.y1) / 2
+            for k, t in enumerate(tables):
+                gap = max(b.x0 - t.x1, t.x0 - b.x1)
+                shared = max(0, _overlap(t.x0, t.x1, b.x0, b.x1)) * max(0, _overlap(t.y0, t.y1, b.y0, b.y1))
+                if shared >= 0.6 * b.w * b.h or (
+                        b.w <= 3 * glyph and b.h <= 2 * glyph and t.y0 <= cy <= t.y1 and gap <= 2.5 * glyph):
+                    tables[k] = _union_box([t, b])
+                    text.remove(b)
+                    grown = True
+                    break
+            if grown:
+                break
+    return tables, text
+
+
 def _take_labels(blobs: list[_Comp], figures: list[_Figure], glyph: float) -> list[_Comp]:
     """Give each figure its labels (A, B, C, 13: small blobs within ~1 glyph of its
     strokes); return the blobs that remain text."""
@@ -854,14 +1057,13 @@ def _take_labels(blobs: list[_Comp], figures: list[_Figure], glyph: float) -> li
     return text
 
 
-def _attach_beside(figures: list[_Figure], units: list[list[_Comp]]) -> list[list[_Comp]]:
-    """A figure and the lines written beside it (sharing most of their height with it)
-    form one reading unit: the lines on its left (the statement: "ABC dr. in A,
-    BC = 2"), the figure, then the lines on its right (the calculations), each side
-    top to bottom."""
+def _attach_beside(blocks: list[_Comp], units: list[list[_Comp]]) -> list[list[_Comp]]:
+    """A figure (or table) and the lines written beside it (sharing most of their
+    height with it) form one reading unit: the lines on its left (the statement:
+    "ABC dr. in A, BC = 2"), the block, then the lines on its right (the
+    calculations, the monotony read off a table), each side top to bottom."""
     out = [u for u in units]
-    for fig in figures:
-        f = fig.box
+    for f in blocks:
         cx = (f.x0 + f.x1) / 2
         left, right, rest = [], [], []
         for u in out:
@@ -890,7 +1092,9 @@ def _reading_order(units: list[list[_Comp]]) -> list[_Comp]:
 
 def _pad(lines: list[_Comp], glyph: float, w: int, h: int) -> list[BBox]:
     """Pad each box by ~0.4 glyph, but never past the middle of the gap to an
-    overlapping neighbour above or below."""
+    overlapping neighbour above or below. Neighbours whose ink overlaps by up to a
+    glyph (an ascender reaching into the line above) are cut at the middle of the
+    overlap, so consecutive lines never share a strip of the page."""
     pad = max(4, int(0.4 * glyph))
     out = []
     for a in lines:
@@ -898,9 +1102,11 @@ def _pad(lines: list[_Comp], glyph: float, w: int, h: int) -> list[BBox]:
         for b in lines:
             if b is a or _overlap(a.x0, a.x1, b.x0, b.x1) <= 0:
                 continue
-            if b.y1 <= a.y0:
+            above = b.y1 <= a.y0 or (b.y0 < a.y0 and b.y1 < a.y1 and b.y1 - a.y0 <= glyph)
+            below = b.y0 >= a.y1 or (b.y0 > a.y0 and b.y1 > a.y1 and a.y1 - b.y0 <= glyph)
+            if above:
                 top = max(top, (b.y1 + a.y0) // 2)
-            elif b.y0 >= a.y1:
+            elif below:
                 bottom = min(bottom, (a.y1 + b.y0) // 2)
         x0, x1 = max(0, a.x0 - pad), min(w, a.x1 + pad)
         out.append(BBox(x0, top, x1 - x0, bottom - top))
@@ -930,18 +1136,30 @@ def detect_lines(page: Image.Image, params: SegmentationParams | None = None) ->
         return []
     # Figures first: taken out of the ink as whole objects, so the text around them
     # clusters into lines on its own and the drawing becomes one region.
-    figures = _find_figures(_figure_ink(full, glyph), glyph) if params.classify_regions else []
+    # Tables likewise: every row inside the rules is one region, the text beside it
+    # clusters on its own.
+    fig_ink = _figure_ink(full, glyph) if params.classify_regions else None
+    figures = _find_figures(fig_ink, glyph) if params.classify_regions else []
     text_ink = ink & ~np.any([f.mask for f in figures], axis=0) if figures else ink
     blobs = _take_labels(_blobs(text_ink, glyph), figures, glyph)
+    # A table's rules can span 40% of the page too: only lines across most of it are grid here.
+    tables = _find_tables(_figure_ink(full, glyph, TABLE_GRID_SPAN), glyph) if params.classify_regions else []
+    tables, blobs = _take_table_ink(blobs, tables, glyph)
+    if tables:
+        text_ink = text_ink.copy()
+        for t in tables:
+            text_ink[t.y0:t.y1, t.x0:t.x1] = False
     lines = _cluster_lines(blobs, glyph, params)
     units = _split_columns(lines, blobs, text_ink, glyph, params) if params.split_columns else [[ln] for ln in lines]
-    units = _attach_beside(figures, units)
+    units = _attach_beside([f.box for f in figures] + tables, units)
     lines = _reading_order(units)
     if len(lines) < 2 or len(lines) > params.max_lines:
         return []
 
     by_box = {id(f.box): f for f in figures}
-    kinds = ["diagram" if id(ln) in by_box else _classify(ln, full, glyph) if params.classify_regions else "line"
+    table_ids = {id(t) for t in tables}
+    kinds = ["diagram" if id(ln) in by_box else "table" if id(ln) in table_ids
+             else _classify(ln, full, glyph) if params.classify_regions else "line"
              for ln in lines]
     inv = 1.0 / scale
     boxes = _pad(lines, glyph, rgb.shape[1], rgb.shape[0])

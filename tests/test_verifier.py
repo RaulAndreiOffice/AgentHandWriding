@@ -206,6 +206,99 @@ def test_partly_illegible_is_yellow():
     assert one(r"$x = \text{[illegible]} + 2$").status == "yellow"
 
 
+# ---- calculus misreadings: prime after a power, e^n x, x -> 50, table arrows ---
+
+SUBIECTUL3_A = r"$f'(x) = \left(\frac{4}{x} + \ln x - 5\right)' = (4 \cdot x^{-1})' + (e^{n}\cdot x)^{-5}'$"
+
+
+def test_prime_after_power_on_a_bracket_moves_onto_the_bracket():
+    res = one(SUBIECTUL3_A)
+    assert r"(\ln x)'^{-5}" in res.latex                       # and e^{n} \cdot x -> \ln x (page has \ln)
+    assert {"double_superscript", "ln"} <= set(kinds(res))
+    assert res.status == "yellow"
+
+
+@pytest.mark.parametrize("raw, fixed", [
+    (r"$x^{2}' = 2x$", r"$(x^{2})' = 2x$"),                    # a plain base: the power is derived
+    (r"$\left(x+1\right)^{3}' = 3$", r"$\left(x+1\right)'^{3} = 3$"),
+    (r"$e^x' = e^x$", r"$(e^x)' = e^x$"),
+])
+def test_prime_after_power(raw, fixed):
+    assert one(raw).latex == fixed
+
+
+@pytest.mark.skipif(not get_katex_checker().available, reason="Node/KaTeX not installed (npm install in tools/)")
+def test_prime_after_power_parses_with_katex():
+    """The index-1 line of Subiectul 3 was grey: KaTeX "Double superscript"."""
+    res = one(SUBIECTUL3_A, checker=get_katex_checker())
+    assert "syntax" not in kinds(res) and res.status == "yellow"
+
+
+@pytest.mark.parametrize("raw", [r"$(e^{n}\cdot x)' = \frac{1}{x}$", r"$f(x) = 2x + e^n x$", r"$e^{n} x$"])
+def test_e_to_the_n_x_is_ln_x_on_a_calculus_page(raw):
+    res = one(raw, page=[r"$f'(x) = 2$"])
+    assert r"\ln x" in res.latex and "e^" not in res.latex
+    assert "ln" in kinds(res) and res.status == "yellow"
+
+
+def test_e_to_the_n_x_only_flagged_without_calculus():
+    res = one(r"$a_n = e^{n} x$")
+    assert res.latex == r"$a_n = e^{n} x$"
+    assert [(i.kind, i.strength) for i in res.issues] == [("ln", "flag")]
+
+
+@pytest.mark.parametrize("tex", [r"$e^{n+1} x$", r"$e^{2n} x$", r"$x \cdot e^{n}$"])
+def test_other_powers_of_e_are_kept(tex):
+    assert one(tex, page=[r"$f'(x) = 2$"]).latex == tex
+
+
+@pytest.mark.parametrize("raw, fixed", [
+    (r"$\lim_{x \to 50} \frac{x^2+1}{x} = \infty$", r"$\lim_{x \to \infty} \frac{x^2+1}{x} = \infty$"),
+    (r"$\lim_{x \to +50} \frac{1}{x} = 0$", r"$\lim_{x \to +\infty} \frac{1}{x} = 0$"),
+    (r"$\lim_{x \to -5o} \frac{1}{x} = 0$", r"$\lim_{x \to -\infty} \frac{1}{x} = 0$"),
+])
+def test_limit_to_50_is_infinity_for_rational_functions(raw, fixed):
+    res = one(raw)
+    assert res.latex == fixed and "infinity" in kinds(res)
+
+
+def test_limit_to_50_with_asymptotes_on_the_page():
+    res = one(r"$\lim_{x \to 50} (x - \ln x)$", page=[r"Cautam asimptota orizontala"])
+    assert r"\to \infty" in res.latex
+
+
+def test_limit_to_50_without_context_is_only_flagged():
+    res = one(r"$\lim_{x \to 50} (x + 1) = 51$")
+    assert res.latex == r"$\lim_{x \to 50} (x + 1) = 51$"
+    assert [(i.kind, i.strength) for i in res.issues] == [("infinity", "flag")]
+
+
+@pytest.mark.parametrize("tex", [r"$\lim_{x \to 500} \frac{1}{x}$", r"$\lim_{x \to 5.05} \frac{1}{x}$", r"$x = 50$"])
+def test_other_numbers_are_not_infinity(tex):
+    assert one(tex).latex == tex
+
+
+TABLE = (r"$\begin{array}{c|ccc} x & 0 & 4 & +\infty \\ \hline f'(x) & \downarrow & 0 & \uparrow \\ \hline "
+         r"f(x) & \downarrow & & \uparrow \end{array}$")
+
+
+def test_table_arrows_in_the_monotony_row():
+    res = verify_page([TABLE], checker=NoKatex(), kinds=["table"])[0]
+    rows = res.latex.split(r"\\")
+    assert r"\downarrow" in rows[1] and r"\uparrow" in rows[1]  # the f'(x) row is left alone
+    assert r"f(x) & \searrow & & \nearrow" in rows[2]
+    assert "table_arrows" in kinds(res) and res.status == "green"   # formatting only
+
+
+def test_table_arrows_unicode_and_lines_without_rows():
+    res = verify_page(["$f(x) ↓ ↗ ↑$"], checker=NoKatex(), kinds=["table"])[0]
+    assert res.latex.count(r"\searrow") == 1 and res.latex.count(r"\nearrow") == 2
+
+
+def test_arrows_outside_tables_are_kept():
+    assert one(r"$x \downarrow 0$").latex == r"$x \downarrow 0$"
+
+
 def test_page_order_and_length_are_preserved():
     texts = [r"$A(5)$", "", r"$A(s)$"]
     res = verify_page(texts, checker=NoKatex())
