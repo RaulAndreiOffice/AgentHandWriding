@@ -1,0 +1,9 @@
+{
+  "name": "agenthandwriding-tools",
+  "private": true,
+  "description": "KaTeX syntax checker used by app/services/verifier.py (optional: the verifier falls back to structural checks without it).",
+  "type": "module",
+  "dependencies": {
+    "katex": "^0.16.11"
+  }
+}
