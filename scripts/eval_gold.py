@@ -141,7 +141,13 @@ async def transcribe_raw(image: Path) -> list[dict]:
         result = await TranscriptionPipeline(vlm, settings).transcribe(image.read_bytes(), "image/png")
     finally:
         await vlm.client.close()  # inside the loop; asyncio.run() closes it per crop
-    return [{"index": l.index, "bbox": l.bbox, "latex": l.raw_latex, "error": l.error} for l in result.lines]
+    return [{"index": l.index, "bbox": l.bbox, "latex": l.raw_latex, "error": l.error, "kind": l.kind}
+            for l in result.lines]
+
+
+def kinds_of(lines: list[dict]) -> list[str]:
+    """Region kinds for the verifier (tables get the monotony-arrow rule)."""
+    return [l.get("kind", "line") for l in lines]
 
 
 class CachingVLM:
@@ -196,11 +202,12 @@ async def reask_crop(crop_id: str, image: Path, lines: list[dict], cache: Path, 
 
     settings = get_settings()
     seg = segment_page(image.read_bytes(), settings.segmentation_params())
-    out = [LineTranscription(l["index"], l["bbox"], latex=l["latex"], error=l["error"],
+    out = [LineTranscription(l["index"], l["bbox"], latex=l["latex"], error=l["error"], kind=l.get("kind", "line"),
                              raw_latex=l["latex"], source_latex=l["latex"]) for l in lines]
+    kinds = kinds_of(lines)
 
     async def verify(texts, errors, decisions):
-        return verify_page(texts, errors, None, decisions)
+        return verify_page(texts, errors, None, decisions, kinds)
 
     if seg.mode != "lines":
         # Single-region page: the pipeline does not re-ask these either; score the verified text.
@@ -209,7 +216,8 @@ async def reask_crop(crop_id: str, image: Path, lines: list[dict], cache: Path, 
         return out, []
     if [r.bbox.as_list() for r in seg.regions] != [l["bbox"] for l in lines]:
         return None
-    crops = {r.index: (r.image_bytes, r.mime_type) for r in seg.regions}
+    # Like the pipeline: only ordinary lines are re-asked (its prompts are line prompts).
+    crops = {r.index: (r.image_bytes, r.mime_type) for r in seg.regions if r.kind == "line"}
 
     vlm = CachingVLM(cache / "reask" / f"{crop_id}.json", refresh, settings)
     try:
@@ -219,13 +227,14 @@ async def reask_crop(crop_id: str, image: Path, lines: list[dict], cache: Path, 
     return out, events
 
 
-def current_boxes(image: Path) -> list[list[int]]:
-    """Today's segmentation of the crop (to tell whether a cached transcription still applies)."""
+def current_regions(image: Path) -> list[tuple[list[int], str]]:
+    """Today's segmentation of the crop, (bbox, kind) per region (to tell whether a cached
+    transcription still applies, and to know which cached lines are tables)."""
     from app.config import get_settings
     from app.services.segmenter import segment_page
 
     seg = segment_page(image.read_bytes(), get_settings().segmentation_params())
-    return [r.bbox.as_list() for r in seg.regions] if seg.mode == "lines" else []
+    return [(r.bbox.as_list(), r.kind) for r in seg.regions] if seg.mode == "lines" else []
 
 
 def load_lines(crop_id: str, image: Path, cache: Path, refresh: bool, offline: bool = False) -> list[dict] | None:
@@ -234,8 +243,10 @@ def load_lines(crop_id: str, image: Path, cache: Path, refresh: bool, offline: b
     path = cache / f"{crop_id}.json"
     if path.exists() and not refresh:
         lines = json.loads(path.read_text(encoding="utf-8"))
-        boxes = current_boxes(image)
-        if not boxes or boxes == [l["bbox"] for l in lines]:  # single-region pages are not re-segmented
+        regions = current_regions(image)
+        if not regions or [b for b, _ in regions] == [l["bbox"] for l in lines]:  # single-region: not re-segmented
+            for line, (_, kind) in zip(lines, regions):
+                line.setdefault("kind", kind)  # caches written before kinds were recorded
             return lines
         if offline:
             return None
@@ -297,7 +308,7 @@ class Report:
 def score_crop(crop: dict, lines: list[dict], report: Report, reasked=None) -> dict:
     """reasked: the LineTranscriptions after the re-ask pass (None = not run)."""
     regions = [r for r in crop["regions"] if r.get("verified") and r["latex"].strip()]
-    verified = verify_page([l["latex"] for l in lines], [l["error"] for l in lines])
+    verified = verify_page([l["latex"] for l in lines], [l["error"] for l in lines], kinds=kinds_of(lines))
     matches = match_lines(lines, regions)
     raw_t, ver_t, rsk_t = Totals(), Totals(), Totals()
     for k, region in enumerate(regions):
@@ -376,7 +387,7 @@ def main() -> int:
                 # Keep the comparison on the same regions: score the verified text in the re-ask column.
                 print(f"  ! {crop['id']}: segmentation changed since the cache was made; re-ask skipped, "
                       f"verified text counted (run with --refresh)")
-                verified = verify_page([l["latex"] for l in lines], [l["error"] for l in lines])
+                verified = verify_page([l["latex"] for l in lines], [l["error"] for l in lines], kinds=kinds_of(lines))
                 reasked = [SimpleNamespace(latex=v.latex, status=v.status, reasks=[]) for v in verified]
             else:
                 reasked, events = result
