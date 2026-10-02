@@ -180,6 +180,8 @@ def test_failed_line_is_retried(client, fake_vlm, lined_page):
     ("grade_mark", ("yes", "no"), "A^r", {"yes": "yes", "no": "no"}),
     ("en_vs_ln", ("ln", "e^{n}"), "(e^{n} x)'", {"A": "ln", "B": "e^{n}"}),
     ("50_vs_inf", ("∞", "50"), "\\lim_{x \\to 50}", {"A": "∞", "B": "50"}),
+    ("0_vs_inf", ("∞", "0"), "\\lim_{x \\to 0}", {"A": "∞", "B": "0"}),
+    ("frac0_vs_inf", ("∞", "0"), "\\frac{1}{0} = 0", {"A": "∞", "B": "0"}),
 ])
 def test_build_question(key, choices, context, options):
     q = build_question(Issue("k", "m", key=key, choices=choices, context=context))

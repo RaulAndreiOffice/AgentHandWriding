@@ -262,6 +262,72 @@ def test_whole_sign_table_is_one_region_and_text_beside_it_separate_lines():
     assert tables[0].index < min(r.index for r in right)      # table first, then what is read off it
 
 
+SMALL = ImageFont.load_default(size=28)
+
+
+def evaluation_bars() -> Image.Image:
+    """Integration by parts: I = x(e^x+3x) |_0^1  -  S (e^x+3x) dx, the limits written
+    beside thin bars, a wide space around the minus; a fraction whose bar was drawn in
+    two strokes; a short line written above a longer one."""
+    img = Image.new("RGB", (1500, 2000), "white")
+    d = ImageDraw.Draw(img)
+    d.text((80, 60), "b) I = S x f(x) dx", font=FONT, fill=INK)
+    y = 250  # the integration-by-parts row
+    d.text((80, y), "I = x(e^x + 3x)", font=FONT, fill=INK)
+    d.line([(395, y - 25), (395, y + 70)], fill=INK, width=2)        # evaluation bar
+    d.text((405, y - 45), "1", font=SMALL, fill=INK)
+    d.text((405, y + 55), "0", font=SMALL, fill=INK)
+    d.line([(505, y + 22), (525, y + 22)], fill=INK, width=2)        # the minus, a wide space around it
+    d.line([(640, y - 25), (632, y + 70)], fill=INK, width=3)        # integral sign
+    d.text((660, y), "(e^x + 3x) dx", font=FONT, fill=INK)
+    y = 450  # = 3x^2 / 2 with a two-stroke fraction bar
+    d.text((80, y + 20), "= e^x(x-1) +", font=FONT, fill=INK)
+    d.text((330, y - 25), "3x^2", font=FONT, fill=INK)
+    d.line([(322, y + 34), (362, y + 34)], fill=INK, width=2)
+    d.line([(368, y + 34), (412, y + 35)], fill=INK, width=2)
+    d.text((355, y + 45), "2", font=FONT, fill=INK)
+    y = 650  # a short line written right above a longer one
+    d.text((80, y), "2x >= 1", font=FONT, fill=INK)
+    d.text((80, y + 44), "x >= 1/2 => S = [1/2, oo)", font=FONT, fill=INK)
+    return img
+
+
+def test_evaluation_bar_limits_and_wide_spaces_stay_in_one_line():
+    seg = segment_page(png_bytes(evaluation_bars()))
+    row = [r for r in seg.regions if r.bbox.y < 360 and r.bbox.y1 > 220]
+    assert len(row) == 1                                       # not split at the minus, limits not on their own
+    assert row[0].bbox.x <= 85 and row[0].bbox.x1 >= 880       # I = ... to dx
+    assert row[0].bbox.y <= 210 and row[0].bbox.y1 >= 330      # the limits 1 and 0 included
+
+
+def test_fraction_with_a_two_stroke_bar_stays_one_line():
+    seg = segment_page(png_bytes(evaluation_bars()))
+    frac = [r for r in seg.regions if 400 < r.bbox.y1 and r.bbox.y < 540]
+    assert len(frac) == 1 and frac[0].bbox.y <= 430 and frac[0].bbox.y1 >= 520   # 3x^2 over 2, one crop
+
+
+def test_short_line_above_a_longer_one_stays_separate():
+    seg = segment_page(png_bytes(evaluation_bars()))
+    rows = [r for r in seg.regions if r.bbox.y > 600]
+    assert len(rows) == 2                                      # "2x >= 1" and "x >= 1/2 => ..."
+
+
+REAL_INTEGRALS = os.environ.get(
+    "INTEGRALS_IMAGE", r"C:\Users\raulb\Pictures\Screenshots\Captură de ecran 2026-10-02 173407.png")
+
+
+@pytest.mark.skipif(not os.path.exists(REAL_INTEGRALS), reason="real screenshot not available (INTEGRALS_IMAGE)")
+def test_real_integrals_screenshot():
+    """The 670x788 screenshot: the evaluation bars' limits came out as tiny boxes (one read
+    as a 2x2 matrix), and I = x(e^x+3x)|_0^1 - S... was split at the minus."""
+    seg = segment_page(open(REAL_INTEGRALS, "rb").read())
+    lower = [r.bbox for r in seg.regions if r.bbox.y > 430]
+    assert len(lower) == 6                                     # one region per written line
+    assert min(b.h for b in lower) >= 28                       # no slivers of limits or exponents
+    assert lower[0].x <= 50 and lower[0].x1 >= 650             # I = ... - ( S e^x dx + 3 S x dx ) one region
+    assert all(a.y1 <= b.y + 2 for a, b in zip(lower, lower[1:]))
+
+
 REAL_SIGN_TABLE = os.environ.get(
     "SIGN_TABLE_IMAGE", r"C:\Users\raulb\Pictures\Screenshots\Captură de ecran 2026-10-02 112016.png")
 

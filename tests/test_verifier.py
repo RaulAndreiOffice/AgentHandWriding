@@ -299,6 +299,85 @@ def test_arrows_outside_tables_are_kept():
     assert one(r"$x \downarrow 0$").latex == r"$x \downarrow 0$"
 
 
+# ---- asymptotes: x -> 0 for x -> infinity, c/0 = 0, spelled-out conclusions ----
+
+HORIZONTAL = r"c) Căutăm asimptota orizontală"
+OBLIQUE = [r"Căutăm asimptota oblică", r"$y = mx + n, m \neq 0$"]
+
+
+def test_slope_limit_to_zero_is_infinity():
+    res = one(r"$m = \lim_{x \to 0} \frac{f(x)}{x} = \lim_{x \to 0} \frac{4}{x^2} = \frac{4}{0} = 0$", page=OBLIQUE)
+    assert res.latex == (r"$m = \lim_{x \to \infty} \frac{f(x)}{x} = \lim_{x \to \infty} \frac{4}{x^2} "
+                         r"= \frac{4}{\infty} = 0$")
+    issue = next(i for i in res.issues if i.key == "0_vs_inf")
+    assert issue.strength == "strong" and res.status == "yellow"
+
+
+def test_horizontal_asymptote_limit_with_infinity_in_the_line():
+    res = one(r"$\lim_{x \to 0} f(x) = \frac{4}{0} + \ln \infty - 5 = \infty$", page=[HORIZONTAL])
+    assert res.latex == r"$\lim_{x \to \infty} f(x) = \frac{4}{\infty} + \ln \infty - 5 = \infty$"
+
+
+def test_limit_to_zero_only_flagged_without_line_evidence():
+    res = one(r"$\lim_{x \to 0} (x^2 + 3)$", page=[HORIZONTAL])
+    assert res.latex == r"$\lim_{x \to 0} (x^2 + 3)$"
+    assert [(i.key, i.strength) for i in res.issues] == [("0_vs_inf", "flag")]
+
+
+@pytest.mark.parametrize("tex, page", [
+    (r"$\lim_{x \to 0} \frac{\sin x}{x} = 1$", []),                          # no asymptote on the page
+    (r"$\lim_{x \to 0^+} \ln x = -\infty$", [HORIZONTAL]),                    # one-sided: a vertical asymptote
+    (r"$\lim_{x \to 0} f(x) = \infty$", [HORIZONTAL, "asimptota verticala x = 0"]),
+    (r"$\lim_{x \to 0.5} \frac{1}{x}$", [HORIZONTAL]),
+])
+def test_genuine_limits_at_zero_are_kept(tex, page):
+    res = one(tex, page=page)
+    assert res.latex == tex
+    assert not [i for i in res.issues if i.fixed and i.content]
+
+
+def test_fraction_over_zero_equal_to_zero_is_over_infinity():
+    res = one(r"$\lim_{x \to \infty} \frac{1}{x} = \frac{1}{0} = 0$")
+    assert res.latex == r"$\lim_{x \to \infty} \frac{1}{x} = \frac{1}{\infty} = 0$"
+    assert any(i.key == "frac0_vs_inf" and i.strength == "strong" for i in res.issues)
+
+
+def test_fraction_over_zero_outside_limits_is_kept():
+    assert one(r"$\frac{1}{0} = 0$").latex == r"$\frac{1}{0} = 0$"
+
+
+SPELLED = (r"$\mathrm{d}i\mathrm{n}\left(\mathbb{R}\right)\ \mathrm{s}\mathrm{i}\ \left(\mathbb{R}\right)\Rightarrow "
+           r"\mathrm{n}\mathrm{u}\ \mathrm{e}\mathrm{x}\mathrm{i}\mathrm{s}\mathrm{t}\mathrm{a}\ "
+           r"\mathrm{a}\mathrm{s}\mathrm{i}\mathrm{m}\mathrm{p}\mathrm{t}\mathrm{o}\mathrm{t}\mathrm{a}\ "
+           r"\mathrm{s}\mathrm{p}\mathrm{r}\mathrm{e}\ +\infty\ \mathrm{l}\mathrm{a}\ G_f$")
+
+
+def test_spelled_out_romanian_sentence_becomes_text():
+    res = one(SPELLED, page=[r"$\lim_{x \to \infty} f(x) = \infty$ (1)", r"$m = 0$ (2)"])
+    assert res.latex == r"din (1) si (2) $\Rightarrow$ nu exista asimptota spre $+\infty$ la $G_f$"
+    assert "spelled_prose" in kinds(res) and res.status == "yellow"
+
+
+def test_references_numbered_in_order_without_page_labels():
+    res = one(r"$\mathrm{d}i\mathrm{n}\ (\mathbb{R})\ \mathrm{s}\mathrm{i}\ (\mathbb{R})$")
+    assert res.latex == "din (1) si (2)"
+
+
+@pytest.mark.parametrize("tex", [
+    r"$\int_0^1 x \, \mathrm{d}x = \frac{1}{2}$",
+    r"$f : \mathbb{R} \to \mathbb{R}, \mathrm{e}^x$",
+    r"$x \in (\mathbb{R})$",
+    r"$\mathrm{rang}(A) = 2$",
+])
+def test_math_with_mathrm_is_not_prose(tex):
+    assert one(tex).latex == tex
+
+
+@pytest.mark.skipif(not get_katex_checker().available, reason="Node/KaTeX not installed (npm install in tools/)")
+def test_spelled_sentence_parses_with_katex():
+    assert "syntax" not in kinds(one(SPELLED, checker=get_katex_checker()))
+
+
 def test_page_order_and_length_are_preserved():
     texts = [r"$A(5)$", "", r"$A(s)$"]
     res = verify_page(texts, checker=NoKatex())

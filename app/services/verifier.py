@@ -101,6 +101,10 @@ _CALCULUS = re.compile(r"[a-z]\s*'|\\prime|\\lim|\\ln|\\int|\\to(?![A-Za-z])|der
                        re.IGNORECASE)
 #: Asymptotes or infinity on the page: "x -> 50" there is a misread "x -> infinity".
 _ASYMPTOTE = re.compile(r"asimpt|\\infty|∞", re.IGNORECASE)
+#: Horizontal / oblique asymptotes are limits at infinity: y = mx + n, m = lim f(x)/x.
+_AT_INFINITY = re.compile(r"orizontal|oblic|y\s*=\s*m\s*x", re.IGNORECASE)
+#: An equation reference at the end of a line: "... spre +oo (1)".
+_REF_LABEL = re.compile(r"(?:\\left\s*)?\(\s*(\d)\s*(?:\\right\s*)?\)\s*\$*\s*$")
 
 
 @dataclass
@@ -115,6 +119,12 @@ class PageContext:
     has_ln: bool = False
     #: asymptotes or infinity on the page (evidence for x -> 50 being x -> infinity)
     asymptotes: bool = False
+    #: horizontal / oblique asymptotes are computed on the page (limits at infinity)
+    at_infinity: bool = False
+    #: a vertical asymptote too (limits at a point such as x -> 0 are real there)
+    vertical: bool = False
+    #: equation references the page defines at line ends, in order: ["1", "2"]
+    ref_labels: list[str] = field(default_factory=list)
 
     @classmethod
     def from_texts(cls, texts: list[str]) -> PageContext:
@@ -122,9 +132,12 @@ class PageContext:
         args: dict[str, set[str]] = {}
         for name, sign, arg in _FUNC_ARG.findall(joined):
             args.setdefault(name, set()).add(sign + arg)
+        labels = [m.group(1) for ln in joined.splitlines() if (m := _REF_LABEL.search(ln))]
         return cls(args, bool(_T_VARIABLE.search(joined)), calculus=bool(_CALCULUS.search(joined)),
                    has_ln=bool(re.search(r"\\ln(?![A-Za-z])", joined)),
-                   asymptotes=bool(_ASYMPTOTE.search(joined)))
+                   asymptotes=bool(_ASYMPTOTE.search(joined)), at_infinity=bool(_AT_INFINITY.search(joined)),
+                   vertical=bool(re.search(r"vertical", joined, re.IGNORECASE)),
+                   ref_labels=sorted(set(labels), key=int))
 
 
 # ------------------------------------------------------------ math detection
@@ -192,6 +205,104 @@ def _wrap_math_runs(text: str) -> tuple[str, bool]:
                 return f"{label}${rest.strip()}$", True
             parts.append(f"${chunk}$")
     return label + " ".join(parts), True
+
+
+#: Romanian words of the conclusions written beside the math ("din (1) si (2) => nu exista
+#: asimptota spre +oo la Gf"), without diacritics. With PROSE_WORDS they tell a spelled-out
+#: sentence apart from math such as \mathrm{d}x.
+ROMANIAN_WORDS = {"exista", "existe", "asimptota", "asimptote", "asimptotei", "spre", "rezulta", "avem", "orizontala",
+                  "oblica", "verticala", "punct", "puncte", "minim", "maxim", "functia", "functie", "functiei",
+                  "graficul", "crescatoare", "descrescatoare", "convexa", "concava", "cautam", "conform", "adica",
+                  "doar", "numai", "inflexiune", "extrem", "tabel", "tabelul", "solutie", "solutii", "admite",
+                  "ecuatia", "intervalul", "reala", "reale", "deoarece", "atunci", "daca", "pentru", "rezulta"}
+_PLAIN = str.maketrans("ăâîșțşţ", "aaistst")
+_SPELLED_TOKEN = re.compile(
+    r"(?P<ref>(?:\\left\s*)?\(\s*\\mathbb\s*\{?\s*R\s*\}?\s*(?:\\right\s*)?\))"
+    r"|(?P<sep>(?:\\[ ,;:!]|\\q?quad(?![A-Za-z])|~|\s)+)"
+    r"|\\(?:mathrm|text|textrm|mathit|operatorname)\s*\{(?P<atom>[A-Za-zăâîșțşţĂÂÎȘȚ]+)\}"
+    r"|(?P<letter>(?<!\\)[A-Za-zăâîșțşţĂÂÎȘȚ])"
+    r"|(?P<other>\\[A-Za-z]+|.)", re.DOTALL)
+
+
+def _plain(word: str) -> str:
+    return word.lower().translate(_PLAIN)
+
+
+def unspell_prose(tex: str, ctx: PageContext, issues: list[Issue]) -> list[tuple[str, str]] | None:
+    """A Romanian sentence the model spelled out as math, letter by letter:
+    \\mathrm{d}i\\mathrm{n}\\left(\\mathbb{R}\\right)\\ \\mathrm{s}\\mathrm{i} ... -> "din (1) si ...".
+
+    Rebuilds words from \\mathrm{...} pieces and bare letters; when one of them is a
+    Romanian word, the words become text again and the rest stays math. A (\\mathbb{R})
+    next to them is an equation reference, "(1)" / "(2)" - numbered after the labels
+    the page defines, else 1, 2, ... Returns the new segments, or None when the math
+    is not a spelled-out sentence (\\mathrm{d}x, \\mathrm{e}^x are left alone).
+    """
+    toks: list[list] = []  # [kind, letters (words) or text, spelled with \mathrm, original LaTeX]
+    for m in _SPELLED_TOKEN.finditer(tex):
+        kind = m.lastgroup
+        if kind in ("atom", "letter"):
+            if not toks or toks[-1][0] != "word":
+                toks.append(["word", "", False, ""])
+            toks[-1][1] += m.group(kind)
+            toks[-1][2] |= kind == "atom"
+            toks[-1][3] += m.group(0)
+        else:
+            toks.append([kind, m.group(0), False, m.group(0)])
+
+    def prose(t) -> bool:
+        word = _plain(t[1])
+        if word in MATH_WORDS or len(word) < 2:
+            return False
+        return word in PROSE_WORDS or word in ROMANIAN_WORDS or (t[2] and len(word) >= 3) or len(word) >= 5
+
+    if not any(t[0] == "word" and t[2] and (_plain(t[1]) in PROSE_WORDS or _plain(t[1]) in ROMANIAN_WORDS)
+               for t in toks):
+        return None
+
+    words = [t[0] == "word" and prose(t) for t in toks]
+
+    def next_word(k: int, step: int) -> bool:
+        k += step
+        while 0 <= k < len(toks) and toks[k][0] == "sep":
+            k += step
+        return 0 <= k < len(toks) and words[k]
+
+    refs = [k for k, t in enumerate(toks) if t[0] == "ref" and (next_word(k, -1) or next_word(k, 1))]
+    numbers = ctx.ref_labels if len(ctx.ref_labels) == len(refs) else [str(n + 1) for n in range(len(refs))]
+    segs: list[tuple[str, str]] = []
+
+    def add(kind: str, text: str) -> None:
+        if segs and segs[-1][0] == kind:
+            segs[-1] = (kind, segs[-1][1] + text)
+        else:
+            segs.append((kind, text))
+
+    for k, t in enumerate(toks):
+        if words[k]:
+            add("text", t[1])
+        elif k in refs:
+            space = " " if segs and segs[-1][0] == "text" and not segs[-1][1].endswith(" ") else ""
+            add("text", f"{space}({numbers[refs.index(k)]})")
+        elif t[0] == "sep":
+            add(segs[-1][0] if segs else "text", " " if segs and segs[-1][0] == "text" else t[1])
+        else:
+            add("$", t[3])
+    out: list[tuple[str, str]] = []
+    for kind, text in segs:
+        if kind == "$":
+            text = re.sub(r"^(?:\\[ ,;:!]|\s)+|(?:\\[ ,;:!]|\s)+$", "", text)
+            if not text:
+                continue
+            if out and out[-1][0] == "text" and not out[-1][1].endswith(" "):
+                out[-1] = ("text", out[-1][1] + " ")
+        elif out and out[-1][0] == "$":
+            text = " " + text.lstrip()
+        out.append((kind, text))
+    issues.append(Issue("spelled_prose", "Romanian words spelled out as math (\\mathrm{d}i\\mathrm{n} ...) written as "
+                        "text" + (f"; (\\mathbb{{R}}) read as the reference(s) {', '.join(numbers)}" if refs else ""),
+                        fixed=True, strength="weak"))
+    return out
 
 
 # ----------------------------------------------------------------- segments
@@ -372,6 +483,13 @@ def fix_power_prime(tex: str, issues: list[Issue]) -> str:
 _E_N_X = re.compile(r"(?<![A-Za-z\\])e\s*\^\s*(?:\{\s*n\s*\}|n)\s*(?:\\cdot\s*)?(?=x(?![A-Za-z]))")
 #: "x -> infinity" read as "x -> 50": the infinity sign as a 5 and an o.
 _TO_FIFTY = re.compile(r"(\\to|\\rightarrow|->)\s*([+-]?)\s*(?:50|5o|5O|S0)(?![0-9.,])")
+#: The variable of a limit tending to 0 (two-sided: 0^+ / 0_{>} are vertical-asymptote limits).
+_LIM_TO_ZERO = re.compile(r"(\\lim\s*_\s*\{?\s*[a-z]\s*(?:\\to|\\rightarrow|->)\s*)([+-]?)\s*0(?![0-9.,^_]|\s*[\^_])")
+#: The slope / intercept of an oblique asymptote: m = lim f(x)/x, n = lim (f(x) - mx).
+_SLOPE_LIMIT = re.compile(r"(?<![A-Za-z\\])[mn]\s*=\s*\\lim|\\frac\s*\{\s*f\s*\(\s*x\s*\)\s*\}\s*\{\s*x\s*\}"
+                          r"|f\s*\(\s*x\s*\)\s*-\s*m\s*x")
+#: c / 0 = 0 (with a simple numerator).
+_FRAC_OVER_ZERO = re.compile(r"\\frac\s*\{([^{}]*)\}\s*\{\s*0\s*\}(?=\s*=\s*0(?![0-9.,]))")
 _VERTICAL_ARROWS = {r"\downarrow": r"\searrow", r"\Downarrow": r"\searrow", r"\uparrow": r"\nearrow",
                     r"\Uparrow": r"\nearrow"}
 _DERIVATIVE_ROW = re.compile(r"[A-Za-z]\s*(?:'|\\prime|\^\s*\{\s*\\prime)")
@@ -435,6 +553,30 @@ def fix_math(tex: str, ctx: PageContext, issues: list[Issue], decisions: dict[st
                          else f"'{m.group(0).strip()}': 50 may be a misread infinity")
         if chosen == "∞":
             tex = _TO_FIFTY.sub(lambda mm: f"{mm.group(1)} {mm.group(2)}\\infty", tex)
+
+    # "x -> infinity" read as "x -> 0" while computing a horizontal / oblique asymptote.
+    m = _LIM_TO_ZERO.search(tex)
+    if m and ctx.at_infinity:
+        slope = bool(_SLOPE_LIMIT.search(tex))  # m = lim f(x)/x, n = lim (f(x) - mx)
+        likely = slope or (("\\infty" in tex or _FRAC_OVER_ZERO.search(tex)) and not ctx.vertical)
+        chosen = _decide(issues, decisions, kind="infinity", key="0_vs_inf", choices=("∞", "0"),
+                         default="∞" if likely else None, strong=slope,
+                         context=_snippet(tex, m.start(), m.end()),
+                         message="limit read as x -> 0 on a horizontal/oblique asymptote: x -> infinity" if likely
+                         else "limit x -> 0 next to horizontal/oblique asymptotes: 0 may be a misread infinity")
+        if chosen == "∞":
+            tex = _LIM_TO_ZERO.sub(lambda mm: f"{mm.group(1)}{mm.group(2)}\\infty", tex)
+            # x -> infinity: a constant over x tends to c / infinity, not c / 0.
+            tex = re.sub(r"\\frac\s*\{\s*([0-9]+)\s*\}\s*\{\s*0\s*\}", r"\\frac{\1}{\\infty}", tex)
+
+    # "c / infinity = 0" read as "c / 0 = 0": a division by zero is never 0.
+    m = _FRAC_OVER_ZERO.search(tex)
+    if m and ("\\lim" in tex or ctx.asymptotes):
+        chosen = _decide(issues, decisions, kind="infinity", key="frac0_vs_inf", choices=("∞", "0"),
+                         default="∞", strong=True, context=_snippet(tex, m.start(), m.end() + 4),
+                         message=f"'{m.group(0).strip()} = 0' read as a fraction over infinity")
+        if chosen == "∞":
+            tex = _FRAC_OVER_ZERO.sub(lambda mm: f"\\frac{{{mm.group(1)}}}{{\\infty}}", tex)
 
     def to_env(m: re.Match) -> str:
         env = {"(": "pmatrix", "|": "vmatrix", "[": "bmatrix"}[m.group(1)]
@@ -635,6 +777,11 @@ def _fix_line(line: str, ctx: PageContext, issues: list[Issue], decisions: dict[
                 out.extend((k, c if k == "text" else fix_math(c, ctx, issues, decisions))
                            for k, c in split_segments(wrapped)[0])
                 continue
+        if kind != "text" and (prose := unspell_prose(content, ctx, issues)) is not None:
+            if out and out[-1][0] == "text" and prose[0][0] == "text":
+                out[-1] = ("text", out[-1][1] + prose.pop(0)[1])
+            out.extend((k, c if k == "text" else fix_math(c, ctx, issues, decisions)) for k, c in prose)
+            continue
         out.append((kind, content if kind == "text" else fix_math(content, ctx, issues, decisions)))
     # Replacements add a trailing space; keep single spaces inside math, none before the closing $.
     def tidy(c: str) -> str:

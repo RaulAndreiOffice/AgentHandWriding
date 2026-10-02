@@ -361,7 +361,81 @@ def _is_bar(c: _Comp, glyph: float) -> bool:
     return c.w >= 0.8 * glyph and c.h <= 0.45 * glyph and c.w >= 3 * c.h
 
 
+def _join_bar_pieces(blobs: list[_Comp], glyph: float) -> list[_Comp]:
+    """A fraction bar drawn with a pen lift (or thinned to a dotted line by a downscaled
+    screenshot) comes out in pieces, each too short to span the numerator. Join flat
+    pieces at the same height less than half a glyph apart."""
+    bars = sorted((b for b in blobs if _is_bar(b, glyph) or (b.h <= 0.3 * glyph and b.w >= 0.5 * glyph)),
+                  key=lambda b: b.x0)
+    rest = [b for b in blobs if b not in bars]
+    joined: list[_Comp] = []
+    for b in bars:
+        for k, a in enumerate(joined):
+            # Level with each other (a minus sign just before a fraction sits a little higher).
+            if b.x0 - a.x1 <= 0.5 * glyph and abs((a.y0 + a.y1) - (b.y0 + b.y1)) / 2 <= max(2.0, 0.1 * glyph) \
+                    and _is_bar(_union_box([a, b]), glyph):
+                joined[k] = _union_box([a, b])
+                break
+        else:
+            joined.append(b)
+    return rest + joined
+
+
+def _coverage(box: _Comp, blobs: list[_Comp]) -> float:
+    """Share of the box's width covered by the blobs inside it: a row of scattered
+    limits or exponents covers little, a written line most of its width."""
+    covered = np.zeros(max(1, box.w), bool)
+    for b in blobs:
+        if box.x0 <= (b.x0 + b.x1) / 2 <= box.x1 and box.y0 <= (b.y0 + b.y1) / 2 <= box.y1:
+            covered[max(0, b.x0 - box.x0):max(0, b.x1 - box.x0)] = True
+    return float(covered.mean())
+
+
+def _absorb_fragments(lines: list[_Comp], glyph: float, blobs: list[_Comp]) -> list[_Comp]:
+    """Rows of loose marks belong to the line they touch: the limits of an evaluation bar
+    |_0^1 or of an integral, exponents and an annotation above a formula, whose bar or
+    sign was too faint to tie them to it. A fragment is low (<= 1.6 glyphs), carries
+    little ink (<= 1.5 glyph areas), is much
+    narrower than its line (<= 60%) and touches or overlaps it - or, for a row of
+    scattered marks (covering <= 40% of its width: the 0s under two integrals), sits
+    within half a glyph of it. Limits and exponents sit over the inside of their line;
+    a short written line ("2x >= 1" above "x >= 1/2 => ...") starts where the next line
+    starts, has white below it and covers its width. The line on the fragment's other side
+    must keep its distance (>= 0.5 glyph): a short line packed between two others
+    ("AC = 16") touches both and stays a line."""
+    changed = True
+    while changed:
+        changed = False
+        for f in sorted(lines, key=lambda c: c.w):
+            # A few marks (<= 1.5 glyphs of ink: limits, an exponent, a lone numerator),
+            # not a short written line ("2x >= 1" carries several glyphs).
+            if f.h > 1.6 * glyph or f.area > 1.5 * glyph * glyph:
+                continue
+            reach = 0.5 * glyph if _coverage(f, blobs) <= 0.4 else 0.0
+            best, best_gap = None, reach
+            for ln in lines:
+                if ln is f or f.w > 0.6 * ln.w or f.x0 < ln.x0 - glyph or f.x1 > ln.x1 + glyph:
+                    continue
+                if f.x0 <= ln.x0 + glyph:  # starts where the line starts: a short line of its own
+                    continue
+                gap = max(ln.y0 - f.y1, f.y0 - ln.y1)
+                if gap <= best_gap:
+                    best, best_gap = ln, gap
+            if best is not None:
+                below = best.y0 >= (f.y0 + f.y1) / 2  # the fragment hangs above its line
+                other = [max(ln.y0 - f.y1, f.y0 - ln.y1) for ln in lines
+                         if ln is not f and ln is not best and _overlap(ln.x0, ln.x1, f.x0, f.x1) > 0
+                         and ((ln.y1 <= best.y0) if below else (ln.y0 >= best.y1))]
+                if other and min(other) < 0.5 * glyph:
+                    continue
+                lines = [ln for ln in lines if ln is not f and ln is not best] + [_union_box([best, f])]
+                changed = True
+                break
+    return lines
+
+
 def _cluster_lines(blobs: list[_Comp], glyph: float, params: SegmentationParams) -> list[_Comp]:
+    blobs = _join_bar_pieces(blobs, glyph)
     n = len(blobs)
     uf = _UnionFind(n)
     bars = [_is_bar(b, glyph) for b in blobs]
@@ -471,7 +545,9 @@ def _cluster_lines(blobs: list[_Comp], glyph: float, params: SegmentationParams)
         if best is not None:
             lines[best] = _union_box([lines[best], f])
 
-    # Drop lines with too little ink to be writing (a stray mark, a smudge).
+    # Limits, exponents and other loose marks join the line they belong to; then drop
+    # lines with too little ink to be writing (a stray mark, a smudge).
+    lines = _absorb_fragments(lines, glyph, blobs)
     lines = [ln for ln in lines if ln.area >= glyph * glyph * 0.5]
 
     # 5. Box merging: fragments have grown the boxes, so boxes may now overlap
@@ -572,8 +648,16 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
 
 
-def _rows_aligned(left: list[_Comp], right: list[_Comp]) -> bool:
-    """Both sides have the same rows: a matrix or table read across, not two columns."""
+def _rows_aligned(left: list[_Comp], right: list[_Comp], glyph: float, blobs: list[_Comp]) -> bool:
+    """Both sides have the same rows: a matrix or table read across, or one formula with
+    a wide space in it - not two columns. Rows of a few loose marks (the limits of an
+    evaluation bar |_0^1, exponents: low, covering little of their width) do not count:
+    they belong to a row beside them."""
+    def real(rows: list[_Comp]) -> list[_Comp]:
+        kept = [r for r in rows if r.h > 1.6 * glyph or _coverage(r, blobs) > 0.4]
+        return kept or rows
+
+    left, right = real(left), real(right)
     if len(left) != len(right):
         return False
     left, right = sorted(left, key=lambda c: c.y0), sorted(right, key=lambda c: c.y0)
@@ -605,7 +689,7 @@ def _split_columns(lines: list[_Comp], blobs: list[_Comp], ink: np.ndarray, glyp
         inside = [b for b in blobs if ln.x0 <= (b.x0 + b.x1) / 2 < ln.x1 and ln.y0 <= (b.y0 + b.y1) / 2 < ln.y1]
         left = _cluster_lines([b for b in inside if (b.x0 + b.x1) / 2 < mid], glyph, params)
         right = _cluster_lines([b for b in inside if (b.x0 + b.x1) / 2 >= mid], glyph, params)
-        if not left or not right or _rows_aligned(left, right):
+        if not left or not right or _rows_aligned(left, right, glyph, inside):
             units.append([ln])
             continue
         units.append(sorted(left, key=lambda c: c.y0) + sorted(right, key=lambda c: c.y0))
@@ -1027,8 +1111,10 @@ def _take_table_ink(blobs: list[_Comp], tables: list[_Comp], glyph: float) -> tu
             for k, t in enumerate(tables):
                 gap = max(b.x0 - t.x1, t.x0 - b.x1)
                 shared = max(0, _overlap(t.x0, t.x1, b.x0, b.x1)) * max(0, _overlap(t.y0, t.y1, b.y0, b.y1))
-                if shared >= 0.6 * b.w * b.h or (
-                        b.w <= 3 * glyph and b.h <= 2 * glyph and t.y0 <= cy <= t.y1 and gap <= 2.5 * glyph):
+                in_rows = t.y0 <= cy <= t.y1 and b.h <= 2 * glyph
+                # An arrow or rule starting inside the table runs on in its row.
+                if shared >= 0.6 * b.w * b.h or (in_rows and t.x0 <= b.x0 < t.x1) or (
+                        in_rows and b.w <= 3 * glyph and gap <= 2.5 * glyph):
                     tables[k] = _union_box([t, b])
                     text.remove(b)
                     grown = True

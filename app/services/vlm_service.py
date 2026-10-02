@@ -36,7 +36,7 @@ LINE_SYSTEM_PROMPT = (
     "Transcribe this crop (one line, or a few tightly packed lines, of handwritten math) "
     "into KaTeX/LaTeX exactly as written; do not solve or correct.\n"
     + CONVENTIONS +
-    "- Math in $...$, words as plain text; one output line per written line.\n"
+    "- Math in $...$, words as plain text (not \\mathrm); one output line per written line.\n"
     "- Ignore check marks, scores, stickers. Illegible symbol: \\text{[illegible]}.\n"
     "- Output only the transcription, no commentary, no code fences; nothing if the crop is empty."
 )

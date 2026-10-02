@@ -114,6 +114,16 @@ def build_question(issue: Issue) -> Question | None:
             f"This handwritten line was read as: {ctx}. Look at what x tends to, read as '50'. Is it "
             f"A: infinity ∞ (a sideways 8), or B: the number 50? Answer A or B.",
             {"A": "∞", "B": "50"})
+    if key == "0_vs_inf":
+        return Question(
+            f"This handwritten line was read as: {ctx}. Look at what x tends to under lim, read as '0'. "
+            f"Is it A: infinity ∞ (a sideways 8), or B: the digit 0? Answer A or B.",
+            {"A": "∞", "B": "0"})
+    if key == "frac0_vs_inf":
+        return Question(
+            f"This handwritten line was read as: {ctx}. Look at the denominator read as '0' in the fraction "
+            f"before '= 0'. Is it A: infinity ∞ (a sideways 8), or B: the digit 0? Answer A or B.",
+            {"A": "∞", "B": "0"})
     if key == "grade_mark":
         return Question(
             "Look at the end of this handwritten line. Is there the mark „A” (a capital A, usually "
