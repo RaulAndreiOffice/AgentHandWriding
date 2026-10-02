@@ -695,7 +695,7 @@ def _corners(segs: list[tuple[int, int, int, int]], glyph: float) -> int:
     for i, a in enumerate(segs):
         for b in segs[i + 1:]:
             diff = abs(angle(a) - angle(b))
-            if min(diff, 180 - diff) < 25:
+            if min(diff, 180 - diff) < 12:  # an obtuse apex is still a corner
                 continue
             for end in (a[:2], a[2:]):
                 if dist(end, b) <= 0.8 * glyph and all(np.hypot(end[0] - q[0], end[1] - q[1]) > glyph for q in points):
@@ -704,6 +704,84 @@ def _corners(segs: list[tuple[int, int, int, int]], glyph: float) -> int:
                 if dist(end, a) <= 0.8 * glyph and all(np.hypot(end[0] - q[0], end[1] - q[1]) > glyph for q in points):
                     points.append(end)
     return len(points)
+
+
+def _crossing(segs: list[tuple[int, int, int, int]], glyph: float) -> bool:
+    """Two long strokes that cross well inside both (a table's rules, a strike through
+    an integral). A polygon's sides meet at their ends - a hand-drawn side may
+    overshoot a corner by about a glyph, a table's rules run on by a cell or more."""
+    m = 1.5 * glyph
+    for i, (ax0, ay0, ax1, ay1) in enumerate(segs):
+        for bx0, by0, bx1, by1 in segs[i + 1:]:
+            d = (ax1 - ax0) * (by1 - by0) - (ay1 - ay0) * (bx1 - bx0)
+            if abs(d) < 1e-6:
+                continue
+            t = ((bx0 - ax0) * (by1 - by0) - (by0 - ay0) * (bx1 - bx0)) / d
+            u = ((bx0 - ax0) * (ay1 - ay0) - (by0 - ay0) * (ax1 - ax0)) / d
+            la, lb = np.hypot(ax1 - ax0, ay1 - ay0), np.hypot(bx1 - bx0, by1 - by0)
+            if m / la < t < 1 - m / la and m / lb < u < 1 - m / lb:
+                return True
+    return False
+
+
+def _figure_ink(full: np.ndarray, glyph: float) -> np.ndarray:
+    """Ink for finding figures: everything before the long-line filter (that filter
+    also removes a flat triangle's long base), minus the notebook grid.
+
+    A grid line continues across the page - broken by writing, but on the same row
+    (or column): a horizontal piece is grid when its row carries horizontal runs over
+    at least 40% of the page width (vertical likewise). A pen-drawn base exists only
+    for its own length. (Stroke thickness does not separate them: on a 600 px
+    screenshot pen strokes are 1-2 px, as thin as the grid.) Rows within 2 px of a
+    grid row count too, for slightly tilted photos.
+    """
+    u8 = full.astype(np.uint8)
+    h, w = full.shape
+    run = max(int(2 * glyph), 20)
+    horiz = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((1, run), np.uint8)).astype(bool)
+    vert = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((run, 1), np.uint8)).astype(bool)
+    grid_rows = horiz.sum(axis=1) >= 0.4 * w
+    grid_cols = vert.sum(axis=0) >= 0.4 * h
+    grid_rows = np.convolve(grid_rows, np.ones(5), mode="same") > 0
+    grid_cols = np.convolve(grid_cols, np.ones(5), mode="same") > 0
+    grid = (horiz & grid_rows[:, None]) | (vert & grid_cols[None, :])
+    return full & ~grid
+
+
+def _is_triangle_outline(strokes: np.ndarray, glyph: float) -> bool:
+    """A closed triangle, however flat: the convex hull of the strokes has three
+    prominent corners and most of the ink lies along the hull's edges (a hollow
+    outline; labels or an angle arc touching it may sit inside or just outside)."""
+    pts = cv2.findNonZero(strokes.astype(np.uint8))
+    if pts is None or len(pts) < 20:
+        return False
+    hull = cv2.convexHull(pts)
+    # The smallest triangle around the strokes: a triangle's hull nearly fills it, even
+    # when a label or a short mark at a vertex adds a hull corner of its own.
+    area, tri = cv2.minEnclosingTriangle(pts)
+    if area < (2 * glyph) ** 2 or cv2.contourArea(hull) < 0.8 * area:
+        return False
+    corners = np.round(tri).astype(np.int32).reshape(3, 1, 2)
+    edge = np.zeros(strokes.shape, np.uint8)
+    cv2.polylines(edge, [corners], True, 1, thickness=max(5, int(0.6 * glyph)))
+    if (strokes & edge.astype(bool)).sum() < 0.6 * strokes.sum():
+        return False
+    # Each of the three sides is drawn: a strike-through covers one hull edge at most,
+    # a cursive word's ink lies inside its hull rather than along the edges.
+    # The fitted triangle runs a little off a hand-drawn side (a label written on a side
+    # bulges the hull), more so on longer sides: allow ~6% of the side, >= 1/4 glyph.
+    pts3 = corners.reshape(3, 2)
+    side = max(np.hypot(*(pts3[k] - pts3[(k + 1) % 3])) for k in range(3))
+    reach = max(1, int(0.25 * glyph), int(0.06 * side))
+    near = cv2.dilate(strokes.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=reach)
+    for k in range(3):
+        (x0, y0), (x1, y1) = pts3[k], pts3[(k + 1) % 3]
+        samples = np.linspace(0.25, 0.75, 30)  # the middle of the side: corners may carry labels
+        xs = np.clip((x0 + samples * (x1 - x0)).astype(int), 0, strokes.shape[1] - 1)
+        ys = np.clip((y0 + samples * (y1 - y0)).astype(int), 0, strokes.shape[0] - 1)
+        if near[ys, xs].mean() < 0.6:
+            return False
+    return True
 
 
 def _find_figures(ink: np.ndarray, glyph: float) -> list[_Figure]:
@@ -720,17 +798,36 @@ def _find_figures(ink: np.ndarray, glyph: float) -> list[_Figure]:
     """
     joined = cv2.dilate(ink.astype(np.uint8), np.ones((3, 3), np.uint8))
     labels, comps = _components(joined)
+    h, w = ink.shape
     figures = []
     for i, c in enumerate(comps, start=1):
-        if max(c.w, c.h) < 4 * glyph or min(c.w, c.h) < 2.5 * glyph:
+        if max(c.w, c.h) < 4 * glyph or min(c.w, c.h) < 1.8 * glyph:  # flat triangles are low
             continue
+        if c.x0 <= 0.01 * w or c.y0 <= 0.01 * h or c.x1 >= 0.99 * w or c.y1 >= 0.99 * h or c.w > 0.6 * w:
+            continue  # page edge, desk, spine
         strokes = (labels[c.y0:c.y1, c.x0:c.x1] == i) & ink[c.y0:c.y1, c.x0:c.x1]
         if strokes.sum() >= 0.12 * c.w * c.h or _is_table(strokes, glyph):
             continue
-        segs = _segments(strokes, int(2 * glyph), glyph)
-        if sum(1 for sg in segs if np.hypot(sg[2] - sg[0], sg[3] - sg[1]) >= 2.5 * glyph) < 3:
+        segs = [sg for sg in _segments(strokes, int(2 * glyph), glyph)
+                if np.hypot(sg[2] - sg[0], sg[3] - sg[1]) >= 2.5 * glyph]
+        if len(segs) < 2 or _crossing(segs, glyph):
             continue
-        if _corners(segs, glyph) < 2:
+        # A triangle always has a long oblique side (a right triangle its hypotenuse, a
+        # flat one its two short sides at 8-20 degrees); a table's rules are horizontal
+        # and vertical, its arrows short.
+        if not any(8 <= (np.degrees(np.arctan2(abs(y1 - y0), abs(x1 - x0)))) <= 82
+                   and np.hypot(x1 - x0, y1 - y0) >= 0.3 * max(c.w, c.h) for x0, y0, x1, y1 in segs):
+            continue
+        # Most of a figure's ink lies on its straight sides (an apex label or an angle arc
+        # may touch them); crossed-out text or a circled grade has a long stroke through
+        # or around writing that is not.
+        sides = np.zeros(strokes.shape, np.uint8)
+        for x0, y0, x1, y1 in segs:
+            cv2.line(sides, (x0, y0), (x1, y1), 1, thickness=max(5, int(glyph / 4)))
+        if (strokes & sides.astype(bool)).sum() < 0.6 * strokes.sum():
+            continue
+        # Finally the shape itself: a closed triangle, every side drawn (however flat).
+        if not _is_triangle_outline(strokes, glyph):
             continue
         mask = np.zeros_like(ink)
         mask[c.y0:c.y1, c.x0:c.x1] = strokes
@@ -758,20 +855,22 @@ def _take_labels(blobs: list[_Comp], figures: list[_Figure], glyph: float) -> li
 
 
 def _attach_beside(figures: list[_Figure], units: list[list[_Comp]]) -> list[list[_Comp]]:
-    """A figure and the lines written beside it (right of its centre, sharing most of
-    their height with it) form one reading unit: the figure first, then those lines
-    top to bottom - the formulas that go with the drawing."""
+    """A figure and the lines written beside it (sharing most of their height with it)
+    form one reading unit: the lines on its left (the statement: "ABC dr. in A,
+    BC = 2"), the figure, then the lines on its right (the calculations), each side
+    top to bottom."""
     out = [u for u in units]
     for fig in figures:
         f = fig.box
         cx = (f.x0 + f.x1) / 2
-        beside, rest = [], []
+        left, right, rest = [], [], []
         for u in out:
-            if len(u) == 1 and u[0].x0 >= cx and _overlap(f.y0, f.y1, u[0].y0, u[0].y1) > 0.5 * u[0].h:
-                beside.append(u[0])
+            ln = u[0]
+            if len(u) == 1 and _overlap(f.y0, f.y1, ln.y0, ln.y1) > 0.5 * ln.h and (ln.x0 >= cx or ln.x1 <= cx):
+                (right if ln.x0 >= cx else left).append(ln)
             else:
                 rest.append(u)
-        out = rest + [[f] + sorted(beside, key=lambda c: c.y0)]
+        out = rest + [sorted(left, key=lambda c: c.y0) + [f] + sorted(right, key=lambda c: c.y0)]
     return out
 
 
@@ -831,7 +930,7 @@ def detect_lines(page: Image.Image, params: SegmentationParams | None = None) ->
         return []
     # Figures first: taken out of the ink as whole objects, so the text around them
     # clusters into lines on its own and the drawing becomes one region.
-    figures = _find_figures(ink, glyph) if params.classify_regions else []
+    figures = _find_figures(_figure_ink(full, glyph), glyph) if params.classify_regions else []
     text_ink = ink & ~np.any([f.mask for f in figures], axis=0) if figures else ink
     blobs = _take_labels(_blobs(text_ink, glyph), figures, glyph)
     lines = _cluster_lines(blobs, glyph, params)

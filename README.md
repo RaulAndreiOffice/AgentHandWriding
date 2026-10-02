@@ -124,8 +124,21 @@ pixel values at the 2000 px working scale; unset = automatic from the page's gly
 | `SEG_SPLIT_COLUMNS` (default true), `SEG_COLUMN_GAP_PX` | Split a block of 2+ rows into a left and a right column at an ink-free vertical gutter (auto: 2.5 glyphs wide, 3.5 glyphs of content on each side), e.g. a triangle beside its calculations. Not split when both sides have the same rows (a matrix). |
 | `SEG_CLASSIFY_REGIONS` (default true) | Tag regions `table` (a sign table: a long rule crossing a vertical one) or `diagram` (a figure: mostly line art, few pieces, a long oblique side meeting another stroke). |
 
-**Columns and region kinds.** A split block is read left column first, then the right column, each
-re-clustered into lines. `/api/segment-preview` draws tables orange ("T") and diagrams purple ("D").
+**Figures, columns and region kinds.** Figures are found first, on the ink *before* the ruled-line
+filter (which would remove a flat triangle's long base) minus the notebook grid: a horizontal piece is
+grid when its row carries horizontal runs across at least 40% of the page (vertical likewise), while a
+pen-drawn base exists only for its own length. (Stroke thickness cannot tell them apart: on a 600 px
+screenshot the pen is as thin as the grid.) The triangle test fits the smallest enclosing triangle, so
+a label or short mark at a vertex, or a number written on a side, does not break it. A figure is a closed triangle, however flat or
+obtuse: a connected set of thin sparse strokes whose convex hull has three corners with ink along
+the middle of *each* side (a strike-through covers one side at most, a cursive word's ink lies inside
+its hull), a long oblique side, no strokes crossing in the middle (a table), most ink on straight lines
+(an apex label or angle arc may touch it). Other polygons (squares, rectangles) are read as lines. The drawing's ink is taken out of the text, its labels (A, B, C, 13)
+go with it, and it becomes one `diagram` region, so it is never split between lines nor merged with
+the formulas beside it, even when its sides slant under them and there is no clear gutter. The
+lines on its left come before it, the lines on its right after it. Its crop is masked: only the
+figure and its labels are visible. Remaining side-by-side blocks are split at a clear vertical gutter
+and read left column first, then the right column, each re-clustered into lines. `/api/segment-preview` draws tables orange ("T") and diagrams purple ("D").
 In the API, `lines[].kind` is `line`, `table` or `diagram`:
 
 - **diagram**: not transcribed (the 2B model reads a triangle as a matrix). It is described in a few
