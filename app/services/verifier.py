@@ -125,6 +125,8 @@ class PageContext:
     vertical: bool = False
     #: equation references the page defines at line ends, in order: ["1", "2"]
     ref_labels: list[str] = field(default_factory=list)
+    #: the page computes integrals (evidence for a matrix of limits being an evaluation bar)
+    integrals: bool = False
 
     @classmethod
     def from_texts(cls, texts: list[str]) -> PageContext:
@@ -137,7 +139,8 @@ class PageContext:
                    has_ln=bool(re.search(r"\\ln(?![A-Za-z])", joined)),
                    asymptotes=bool(_ASYMPTOTE.search(joined)), at_infinity=bool(_AT_INFINITY.search(joined)),
                    vertical=bool(re.search(r"vertical", joined, re.IGNORECASE)),
-                   ref_labels=sorted(set(labels), key=int))
+                   ref_labels=sorted(set(labels), key=int),
+                   integrals=bool(re.search(r"\\int(?![A-Za-z])|primitiv|integral", joined, re.IGNORECASE)))
 
 
 # ------------------------------------------------------------ math detection
@@ -495,6 +498,57 @@ _VERTICAL_ARROWS = {r"\downarrow": r"\searrow", r"\Downarrow": r"\searrow", r"\u
 _DERIVATIVE_ROW = re.compile(r"[A-Za-z]\s*(?:'|\\prime|\^\s*\{\s*\\prime)")
 
 
+#: A two-row matrix right after a term: "\frac{x^2}{2} \begin{vmatrix} 1 & 1 \\ -1 & -1 \end{vmatrix}".
+_EVAL_BAR_MATRIX = re.compile(
+    r"(?<=[A-Za-z0-9})\]])(\s*)\\begin\{(vmatrix|pmatrix|bmatrix|Vmatrix|matrix|array)\}(?:\{[^{}]*\})?"
+    r"((?:(?!\\begin|\\end).)*?)\\end\{\2\}", re.DOTALL)
+#: A scribble between two equals signs: "= \text{[illegible]} =".
+_ILLEGIBLE_BETWEEN_EQUALS = re.compile(r"=\s*\\text\s*\{\s*\[illegible\]\s*\}\s*=")
+
+
+def _eval_bar_limits(body: str) -> tuple[str, str] | None:
+    """(upper, lower) when a matrix body is really the two limits of an evaluation bar
+    |_b^a: two rows, each a single entry or the same entry repeated (the model draws
+    the bar's two strokes as two equal columns)."""
+    rows = [r.strip() for r in re.split(r"\\\\", body) if r.strip()]
+    if len(rows) != 2:
+        return None
+    limits = []
+    for row in rows:
+        cells = {c.strip() for c in row.split("&")}
+        if len(cells) != 1 or not re.fullmatch(r"[+-]?\s*(?:\d+(?:[.,]\d+)?|\\infty|[a-z]|\\pi|\\frac\{\d+\}\{\d+\})",
+                                               (cell := cells.pop())):
+            return None
+        limits.append(re.sub(r"\s+", "", cell))
+    return limits[0], limits[1]
+
+
+def fix_eval_bars(tex: str, ctx: PageContext, issues: list[Issue], decisions: dict[str, str]) -> str:
+    """On a calculus page, the evaluation bar of a Leibniz-Newton computation,
+    F(x) |_{-1}^{1}, is read by the 2B model as a 2x2 determinant whose rows repeat
+    the limits: \\begin{vmatrix} 1 & 1 \\\\ -1 & -1 \\end{vmatrix} (or a one-column
+    matrix of the limits). Right after a term (x, \\frac{x^2}{2}, a bracket) it is
+    rewritten as \\Big|_{-1}^{1}. A matrix after "=" or at the start (det A = |...|)
+    is left alone; so is a real matrix (rows with different entries)."""
+    if not ctx.calculus:
+        return tex
+
+    def bar(m: re.Match) -> str:
+        limits = _eval_bar_limits(m.group(3))
+        # After an operator command (\cdot, \times) it is a factor: a column vector.
+        if limits is None or re.search(r"\\[A-Za-z]+$", tex[:m.start()]):
+            return m.group(0)
+        upper, lower = limits
+        chosen = _decide(issues, decisions, kind="eval_bar", key=f"eval_bar:{upper}:{lower}",
+                         choices=("bar", "matrix"), default="bar", strong="\\int" in tex or ctx.integrals,
+                         context=_snippet(tex, m.start(), m.end()),
+                         message=f"matrix of the limits {upper}, {lower} after a term read as the evaluation bar "
+                                 f"\\Big|_{{{lower}}}^{{{upper}}}")
+        return f"{m.group(1)}\\Big|_{{{lower}}}^{{{upper}}}" if chosen == "bar" else m.group(0)
+
+    return _EVAL_BAR_MATRIX.sub(bar, tex)
+
+
 def fix_table_arrows(tex: str, issues: list[Issue]) -> str:
     """In a sign table, the monotony row (f(x)) shows a function going down or up:
     \\downarrow -> \\searrow, \\uparrow -> \\nearrow. Rows of a derivative (f'(x)) are left alone."""
@@ -585,6 +639,14 @@ def fix_math(tex: str, ctx: PageContext, issues: list[Issue], decisions: dict[st
     new = _ARRAY_MATRIX.sub(to_env, tex)
     if new != tex:
         issues.append(Issue("matrix_env", "\\left( array \\right) rewritten as pmatrix/vmatrix", fixed=True, content=False))
+        tex = new
+    tex = fix_eval_bars(tex, ctx, issues, decisions)
+
+    # A scribble the student crossed out between two steps: "= [illegible] =" is one "=".
+    new = _ILLEGIBLE_BETWEEN_EQUALS.sub("=", tex)
+    if new != tex:
+        # Not "illegible": that kind asks for a re-transcription; the scribble is meant to go.
+        issues.append(Issue("scribble", "illegible scribble between two '=' dropped", fixed=True))
         tex = new
 
     # Arrows. Plain "=>" / "<=>" are formatting; "(=)", "c=)", "=)" are misreadings (decisions).

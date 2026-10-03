@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     seg_column_gap_px: int | None = None
     # Tag regions as "table" (sign tables -> array prompt) or "diagram" (figures -> placeholder).
     seg_classify_regions: bool = True
+    # Leave crossed-out lines out (not sent to the VLM, not in the transcript).
+    seg_drop_struck_out: bool = True
     # Pages with more detected lines than this are sent whole (likely mis-segmented).
     seg_max_lines: int = 80
 
@@ -54,6 +56,7 @@ class Settings(BaseSettings):
             split_columns=self.seg_split_columns,
             column_gap_px=self.seg_column_gap_px,
             classify_regions=self.seg_classify_regions,
+            drop_struck_out=self.seg_drop_struck_out,
             max_lines=self.seg_max_lines,
         )
 

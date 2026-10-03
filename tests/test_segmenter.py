@@ -4,12 +4,14 @@ import io
 import os
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
 from app.services.pipeline_service import LineTranscription, _merge
-from app.services.segmenter import (CROP_MAX_UPSCALE, CROP_TARGET_PIXELS, SegmentationParams,
-                                    load_page, segment_page)
+from app.services.segmenter import (CROP_MAX_UPSCALE, CROP_TARGET_PIXELS, SegmentationParams, _classify,
+                                    _Comp, _is_table, load_page, segment_page)
 from app.services.vlm_service import strip_code_fences
 from tests.conftest import LINE_PITCH, make_page, png_bytes
 
@@ -143,3 +145,140 @@ def test_gold_page_is_split_into_lines(path):
     assert len(seg.regions) >= 8  # the sparsest gold page (tema6_p15) has 8 lines
     tallest = max(r.bbox.h for r in seg.regions)
     assert tallest < 0.25 * seg.page_height, f"region of {tallest}px on a {seg.page_height}px page"
+
+
+# ---- sign/variation tables -------------------------------------------------
+
+def _variation_table_page() -> Image.Image:
+    """Statement lines, then a sign table whose vertical rule bows (Hough sees only a
+    chord of it), with the header row "x | -inf -2 2 +inf" above the first rule."""
+    img = make_page(["c) f'(x) = 0", "2 - x = 0", "2 + x = 0"])
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=40)
+    ink = (20, 30, 120)
+    top = 470
+    for i, (label, row) in enumerate([("x", "-oo    -2     2    +oo"), ("f'(x)", "   -    0  +  0   -"),
+                                      ("f(x)", r"   \       /       \ ")]):
+        draw.text((110, top + 15 + 75 * i), label, font=font, fill=ink)
+        draw.text((260, top + 15 + 75 * i), row, font=font, fill=ink)
+    for y in (top + 70, top + 145):  # row rules
+        draw.line((90, y, 820, y + 4), fill=ink, width=3)
+    # The vertical rule bends left in its lower half.
+    draw.line([(235, top), (232, top + 90), (222, top + 150), (212, top + 225)], fill=ink, width=3)
+    draw.text((100, top + 300), "f'(x) > 0 pe (-2, 2)", font=font, fill=ink)
+    return img
+
+
+def test_variation_table_is_one_region_with_its_header_row():
+    seg = segment_page(png_bytes(_variation_table_page()))
+    tables = [r for r in seg.regions if r.kind == "table"]
+    assert len(tables) == 1
+    t = tables[0].bbox
+    assert t.y <= 480 and t.y1 >= 690  # header row (x ...) to the f(x) row
+    # No other region cuts through the table's rows.
+    for r in seg.regions:
+        if r is not tables[0]:
+            assert r.bbox.y1 <= t.y + 15 or r.bbox.y >= t.y1 - 15
+
+
+def _rows_with_crossing_rules(n_rows: int) -> np.ndarray:
+    """n_rows rows of glyph-sized marks, a long horizontal stroke under the first row
+    and a tall vertical stroke crossing it (a "+")."""
+    h = 70 * n_rows
+    m = np.zeros((h, 420), np.uint8)
+    for r in range(n_rows):
+        for x in range(100, 400, 45):
+            cv2.rectangle(m, (x, 8 + 75 * r), (x + 22, 40 + 75 * r), 1, 3)
+    cv2.line(m, (10, 48), (410, 50), 1, 3)
+    cv2.line(m, (60, 2), (61, h - 2), 1, 3)
+    return m.astype(bool)
+
+
+@pytest.mark.parametrize("n_rows, kind", [(1, "line"), (2, "table")])
+def test_one_row_of_writing_is_never_a_table(n_rows, kind):
+    """'C I  2 - x = 0' with an underline crossed by a tall stroke passes the "+" test
+    of a table; it is still one equation. Two rows with the same rules are a table."""
+    sub = _rows_with_crossing_rules(n_rows)
+    assert _is_table(sub, 24.0)
+    assert _classify(_Comp(0, 0, sub.shape[1], sub.shape[0], 0), sub, 24.0) == kind
+
+
+def test_table_with_faint_rules_on_a_low_resolution_page():
+    """A small screenshot: glyphs ~12 px, the table's rules 1 px and light grey (lighter
+    than the ink threshold of the writing). Still one table region."""
+    img = Image.new("RGB", (700, 640), "white")
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=18)
+    ink, rule = (40, 45, 110), (150, 155, 185)
+    for i, text in enumerate(["c) f'(x) = 0", "2 - x = 0", "2 + x = 0"]):
+        draw.text((40, 60 + 50 * i), text, font=font, fill=ink)
+    top = 260
+    for i, (label, row) in enumerate([("x", "-oo     -2      2     +oo"), ("f'(x)", "  -      0  +  0     -"),
+                                      ("f(x)", r"  \        /        \ ")]):
+        draw.text((20, top + 8 + 40 * i), label, font=font, fill=ink)
+        draw.text((100, top + 8 + 40 * i), row, font=font, fill=ink)
+    for y in (top + 36, top + 76):
+        draw.line((10, y, 380, y + 1), fill=rule, width=1)
+    draw.line((85, top, 86, top + 120), fill=rule, width=1)
+    draw.text((40, top + 160), "f'(x) > 0 pe (-2, 2)", font=font, fill=ink)
+    seg = segment_page(png_bytes(img))
+    tables = [r for r in seg.regions if r.kind == "table"]
+    assert len(tables) == 1
+    assert tables[0].bbox.y <= top + 8 and tables[0].bbox.y1 >= top + 100
+
+
+# ---- crossed-out lines ------------------------------------------------------
+
+def _page_with(mark: str) -> tuple[bytes, int]:
+    """Three lines; the middle one ("f'(x) < 0 pe (-oo, -2)") is struck through,
+    underlined, or a wide fraction. Returns the page and the middle line's top."""
+    img = make_page(["c) f'(x) = 0", "", "x = 2"])
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=40)
+    ink = (20, 30, 120)
+    y = 100 + LINE_PITCH
+    if mark == "fraction":  # numerator and denominator around a bar across the line
+        draw.text((100, y - 30), "x^2 - 2x^2 + 4", font=font, fill=ink)
+        draw.line((95, y + 22, 420, y + 22), fill=ink, width=4)
+        draw.text((160, y + 30), "(x^2 + 4)^2", font=font, fill=ink)
+        return png_bytes(img), y - 30
+    # Bold, like pen writing: the strike crosses ink in most of its columns.
+    draw.text((100, y), "f'(x)<0 pe(-oo,-2)", font=font, fill=ink, stroke_width=2, stroke_fill=ink)
+    right = int(draw.textlength("f'(x)<0 pe(-oo,-2)", font=font)) + 100
+    stroke_y = y + 26 if mark == "strike" else y + 52  # through the middle / under the line
+    draw.line((100, stroke_y, right, stroke_y + 3), fill=ink, width=3)
+    return png_bytes(img), y
+
+
+def test_crossed_out_line_is_dropped():
+    page, y = _page_with("strike")
+    seg = segment_page(page)
+    assert seg.mode == "lines"
+    assert not any(r.bbox.y <= y + 20 <= r.bbox.y1 for r in seg.regions)
+    assert len(seg.regions) == 2
+    assert len(segment_page(page, SegmentationParams(drop_struck_out=False)).regions) == 3
+
+
+@pytest.mark.parametrize("mark", ["underline", "fraction"])
+def test_long_bar_that_is_not_a_strike_is_kept(mark):
+    page, y = _page_with(mark)
+    seg = segment_page(page)
+    assert len(seg.regions) == 3
+    assert any(r.bbox.y <= y + 20 <= r.bbox.y1 for r in seg.regions)
+
+
+def test_double_underlined_heading_is_kept():
+    """'Subiectul 2' underlined twice, the upper line through the bottoms of the letters:
+    a heading, not a crossed-out line."""
+    img = make_page(["c) f'(x) = 0", "", "x = 2"])
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=40)
+    ink = (20, 30, 120)
+    y = 100 + LINE_PITCH
+    draw.text((100, y), "Subiectul 2", font=font, fill=ink, stroke_width=2, stroke_fill=ink)
+    right = int(draw.textlength("Subiectul 2", font=font)) + 100
+    draw.line((95, y + 28, right, y + 29), fill=ink, width=3)  # through the letters' bottoms
+    draw.line((95, y + 46, right, y + 47), fill=ink, width=3)  # the underline below
+    seg = segment_page(png_bytes(img))
+    assert len(seg.regions) == 3
+    assert any(r.bbox.y <= y + 20 <= r.bbox.y1 for r in seg.regions)

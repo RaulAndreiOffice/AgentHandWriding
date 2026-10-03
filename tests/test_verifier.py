@@ -382,3 +382,50 @@ def test_page_order_and_length_are_preserved():
     texts = [r"$A(5)$", "", r"$A(s)$"]
     res = verify_page(texts, checker=NoKatex())
     assert [r.latex for r in res] == [r"$A(5)$", "", r"$A(5)$"]
+
+
+# ---- evaluation bars and scribbles --------------------------------------------
+
+INTEGRAL_PAGE = (r"$\int_{-1}^{1} (2x - 1) \, dx$",)
+VBAR = r"\begin{vmatrix} 1 & 1 \\ -1 & -1 \end{vmatrix}"
+
+
+def test_evaluation_bar_read_as_determinant_becomes_a_bar():
+    res = one(rf"$= 2 \cdot \frac{{x^2}}{{2}} {VBAR} - x {VBAR} = 1^2 - (-1)^2$", page=INTEGRAL_PAGE)
+    assert res.latex == r"$= 2 \cdot \frac{x^2}{2} \Big|_{-1}^{1} - x \Big|_{-1}^{1} = 1^2 - (-1)^2$"
+    assert "eval_bar" in kinds(res) and res.status == "yellow"
+
+
+def test_evaluation_bar_read_as_a_column_of_limits():
+    res = one(r"$\frac{x^3}{3} \begin{pmatrix} 3 \\ 0 \end{pmatrix} = 9$", page=INTEGRAL_PAGE)
+    assert res.latex == r"$\frac{x^3}{3} \Big|_{0}^{3} = 9$"
+
+
+@pytest.mark.parametrize("tex, page", [
+    (rf"$\det(A) = {VBAR} = 0$", INTEGRAL_PAGE),  # a real determinant, after "="
+    (r"$A \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}$", INTEGRAL_PAGE),  # rows differ: a real matrix
+    (r"$2 \cdot \begin{pmatrix} 2 \\ 3 \end{pmatrix}$", INTEGRAL_PAGE),  # a factor: a column vector
+    (rf"$x {VBAR}$", ()),  # not a calculus page
+])
+def test_real_matrices_are_not_evaluation_bars(tex, page):
+    res = one(tex, page=page)
+    assert "Big|" not in res.latex and "eval_bar" not in kinds(res)
+
+
+def test_evaluation_bar_parses_with_katex():
+    checker = get_katex_checker()
+    if not checker.available:
+        pytest.skip("KaTeX (tools/node_modules) not installed")
+    res = one(rf"$2 \cdot \frac{{x^2}}{{2}} {VBAR} - x {VBAR}$", page=INTEGRAL_PAGE, checker=checker)
+    assert "syntax" not in kinds(res)
+
+
+def test_illegible_scribble_between_equals_is_collapsed():
+    res = one(r"$x \Big|_{-1}^{1} = \text{[illegible]} = 1 + 1$")
+    assert res.latex == r"$x \Big|_{-1}^{1} = 1 + 1$"
+    assert kinds(res) == ["scribble"] and res.status == "yellow"
+
+
+def test_illegible_part_elsewhere_is_kept():
+    res = one(r"$x = \text{[illegible]} + 2$")
+    assert r"\text{[illegible]}" in res.latex and "illegible" in kinds(res)

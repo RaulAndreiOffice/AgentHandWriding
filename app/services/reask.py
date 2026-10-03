@@ -124,6 +124,13 @@ def build_question(issue: Issue) -> Question | None:
             f"This handwritten line was read as: {ctx}. Look at the denominator read as '0' in the fraction "
             f"before '= 0'. Is it A: infinity ∞ (a sideways 8), or B: the digit 0? Answer A or B.",
             {"A": "∞", "B": "0"})
+    if key.startswith("eval_bar:"):
+        return Question(
+            f"This handwritten line was read as: {ctx}. Look at the part read as a matrix of two numbers "
+            f"stacked one above the other. Is it A: a vertical evaluation bar with the integration limits "
+            f"(F(x) evaluated from the bottom number to the top one), or B: a real matrix or determinant? "
+            f"Answer A or B.",
+            {"A": "bar", "B": "matrix"})
     if key == "grade_mark":
         return Question(
             "Look at the end of this handwritten line. Is there the mark „A” (a capital A, usually "

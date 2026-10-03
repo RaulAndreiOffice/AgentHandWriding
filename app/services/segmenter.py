@@ -93,6 +93,8 @@ class SegmentationParams:
     split_columns: bool = True
     #: Tag regions as "table" (sign/variation tables) or "diagram" (geometric figures).
     classify_regions: bool = True
+    #: Leave out lines the student crossed out (one stroke through the middle of the line).
+    drop_struck_out: bool = True
 
 
 @dataclass(frozen=True)
@@ -183,6 +185,20 @@ def _green_mask(rgb: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     return (hue >= 35) & (hue <= 90) & (sat >= 70) & (val >= 40)  # OpenCV hue is 0..179
+
+
+#: Ink ratio for finding table rules on low-resolution pages (see _faint_ink); the
+#: writing uses 0.5 .. 0.7.
+RULE_INK_RATIO = 0.8
+#: Pages whose glyphs are shorter than this (px) are low resolution: a screenshot or a
+#: small image, where a pen-drawn rule is 1 px wide and anti-aliased to light grey.
+LOW_RES_GLYPH = 16
+
+
+def _faint_ink(rgb: np.ndarray) -> np.ndarray:
+    """Light strokes too: thin, pale table rules that the writing's ink mask breaks up."""
+    ink, _ = _ink(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), RULE_INK_RATIO)
+    return ink & ~_green_mask(rgb)
 
 
 def _margin_edges(ink: np.ndarray, frac: float) -> np.ndarray:
@@ -696,11 +712,81 @@ def _split_columns(lines: list[_Comp], blobs: list[_Comp], ink: np.ndarray, glyp
     return units
 
 
+def _is_struck_out(sub: np.ndarray, glyph: float) -> bool:
+    """A line the student crossed out: one roughly horizontal stroke runs through the
+    middle of its writing (25-75% of its height) over at least half its width, cutting
+    the glyphs it crosses - about half a glyph of ink on each side of it, at most 0.8.
+
+    A fraction bar has a whole numerator and denominator around it (a glyph or more on
+    each side), an underline or a bar over the line nothing on one side. Tuned for
+    precision: a crossed-out line that is missed costs one VLM call; a line wrongly
+    dropped loses part of the solution.
+    """
+    ys, xs = np.nonzero(sub)
+    if not len(ys):
+        return False
+    top, bottom = int(ys.min()), int(ys.max()) + 1
+    ink_w = int(xs.max()) + 1 - int(xs.min())
+    if bottom - top > 3.5 * glyph:  # several rows of writing: never drop the whole block
+        return False
+    u8 = cv2.dilate(sub.astype(np.uint8), np.ones((3, 1), np.uint8))
+    flat = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((1, max(3, int(glyph))), np.uint8))
+    labels, comps = _components(flat.astype(bool))
+    # Pieces of one stroke (a pen that skips, a stroke that tilts): chain pieces that
+    # continue each other at about the same height.
+    pieces = sorted((k for k, c in enumerate(comps, start=1) if c.h <= 0.8 * glyph), key=lambda k: comps[k - 1].x0)
+    strokes: list[list[int]] = []
+    for k in pieces:
+        c = comps[k - 1]
+        for st in strokes:
+            last = comps[st[-1] - 1]
+            if c.x0 - last.x1 <= 0.6 * glyph and abs((c.y0 + c.y1) - (last.y0 + last.y1)) / 2 <= 0.4 * glyph:
+                st.append(k)
+                break
+        else:
+            strokes.append([k])
+    long_strokes = [st for st in strokes if _union_box([comps[k - 1] for k in st]).w >= 0.5 * ink_w]
+    for st in long_strokes:
+        box = _union_box([comps[k - 1] for k in st])
+        cy = (box.y0 + box.y1) / 2
+        if not top + 0.25 * (bottom - top) <= cy <= top + 0.75 * (bottom - top):
+            continue
+        # A double underline under a heading: its upper line may run through the bottoms
+        # of the letters, but a second line runs below it along the bottom of the ink.
+        # (Both lines of a double strike-through cross the writing; nothing is below them.)
+        if any(o is not st and (ob := _union_box([comps[k - 1] for k in o])).y0 > box.y1
+               and ob.y1 >= bottom - 0.3 * glyph for o in long_strokes):
+            continue
+        stroke = np.isin(labels, st)
+        # The writing around the stroke, without the other long strokes: the second line
+        # of a double underline ("Subiectul 2") is not ink the stroke cuts through.
+        others = np.isin(labels, [k for o in long_strokes if o is not st for k in o])
+        writing = sub & ~cv2.dilate(others.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        up, down = [], []
+        for x in range(box.x0, box.x1, 2):
+            on = np.flatnonzero(stroke[:, x])
+            if not len(on):
+                continue
+            above, below = np.flatnonzero(writing[:on[0], x]), np.flatnonzero(writing[on[-1] + 1:, x])
+            up.append(on[0] - above[0] if len(above) else 0)
+            down.append(below[-1] + 1 if len(below) else 0)
+        if not up:
+            continue
+        up_, down_ = np.array(up) / glyph, np.array(down) / glyph
+        reach_up, reach_down = np.percentile(up_, 80), np.percentile(down_, 80)
+        crossed = np.mean((up_ > 0.15) | (down_ > 0.15))  # the stroke runs through writing
+        if 0.15 <= reach_up <= 0.8 and 0.15 <= reach_down <= 0.8 and crossed >= 0.5:
+            return True
+    return False
+
+
 def _classify(box: _Comp, full: np.ndarray, glyph: float) -> RegionKind:
     """table (a sign table) or diagram (a figure such as a triangle), else line;
     judged on all ink inside the box, long table rules included."""
     sub = full[box.y0:box.y1, box.x0:box.x1]
-    if _is_table(sub, glyph):
+    # A table has rows: a single equation ("2 - x = 0", an underlined "C I") never is one,
+    # whatever strokes in it cross.
+    if box.h >= 2 * glyph and _text_rows(sub, glyph) >= 2 and _is_table(sub, glyph):
         return "table"
     if _is_diagram(sub, glyph):
         return "diagram"
@@ -976,6 +1062,59 @@ def _horizontal_runs(ink: np.ndarray, glyph: float) -> list[tuple[float, float, 
     return out
 
 
+def _vertical_runs(ink: np.ndarray, glyph: float) -> list[tuple[float, float, float, float]]:
+    """Vertical strokes at least 2.5 glyphs tall (and under 40% of the page: not a
+    margin line), as end points top to bottom. Like _horizontal_runs: a hand-drawn
+    rule that bows comes out of Hough as one short chord, its other part lost, and
+    then it crosses only one of the row rules."""
+    run = max(3, int(2 * glyph))
+    wide = cv2.dilate(ink.astype(np.uint8), np.ones((1, 3), np.uint8))
+    rules = cv2.morphologyEx(wide, cv2.MORPH_OPEN, np.ones((run, 1), np.uint8))
+    labels, comps = _components(rules.astype(bool))
+    out = []
+    end = max(2, int(0.5 * glyph))
+    for i, c in enumerate(comps, start=1):
+        if c.h < 2.5 * glyph or c.h > 0.4 * ink.shape[0] or c.w > 0.18 * c.h + 3:
+            continue
+        sub = labels[c.y0:c.y1, c.x0:c.x1] == i
+        xs = np.arange(c.x0, c.x1)[None, :]
+        top, bottom = sub[:end], sub[-end:]
+        out.append((float((xs * top).sum() / max(1, top.sum())), float(c.y0),
+                    float((xs * bottom).sum() / max(1, bottom.sum())), float(c.y1 - 1)))
+    # A rule that bends where a row rule crosses it comes out in pieces: join pieces
+    # that continue each other (overlapping or a glyph apart, at the same x).
+    joined = True
+    while joined:
+        joined = False
+        out.sort(key=lambda r: r[1])
+        for i in range(len(out)):
+            for k in range(i + 1, len(out)):
+                a, b = out[i], out[k]  # b starts lower (sorted)
+                if b[1] - a[3] <= glyph and abs(a[2] - b[0]) <= 0.7 * glyph:
+                    out[i] = (a[0], a[1], b[2], b[3]) if b[3] >= a[3] else a
+                    del out[k]
+                    joined = True
+                    break
+            if joined:
+                break
+    return out
+
+
+def _text_rows(sub: np.ndarray, glyph: float) -> int:
+    """Rows of writing in a region, its rules left out: bands of ink at least half a
+    glyph tall, separated by white (or by a removed rule). One equation is one row,
+    even with an underline or a bar over a letter; a sign table has two or three."""
+    u8 = sub.astype(np.uint8)
+    run = max(3, int(2.5 * glyph))
+    rules = cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((1, run), np.uint8)) | \
+        cv2.morphologyEx(u8, cv2.MORPH_OPEN, np.ones((run, 1), np.uint8))
+    rules = cv2.dilate(rules, np.ones((3, 3), np.uint8)).astype(bool)
+    rows = (sub & ~rules).sum(axis=1) >= 2
+    # Bridge tiny breaks inside a row (a dot, the gap between a letter and its bar).
+    rows = np.convolve(rows, np.ones(max(1, int(0.25 * glyph))), mode="same") > 0
+    return sum(1 for a, b in _runs(rows) if b - a >= 0.5 * glyph)
+
+
 def _find_tables(ink: np.ndarray, glyph: float) -> list[_Comp]:
     """Sign/variation tables on the page, found from their rules before the text is
     clustered, so every row (x, f'(x), f(x) with its arrows) stays in one region
@@ -998,7 +1137,8 @@ def _find_tables(ink: np.ndarray, glyph: float) -> list[_Comp]:
         elif 2.5 * glyph <= dy <= 0.4 * ink.shape[0] and dx <= 0.18 * dy:  # not a margin line
             vert.append((x0, y0, x1, y1) if y0 <= y1 else (x1, y1, x0, y0))
     horiz += _horizontal_runs(ink, glyph)
-    if not horiz or not vert:
+    runs = _vertical_runs(ink, glyph)
+    if not horiz or not (vert or runs):
         return []
 
     def y_at(r, x: float) -> float:
@@ -1040,6 +1180,18 @@ def _find_tables(ink: np.ndarray, glyph: float) -> list[_Comp]:
         return []
 
     m = 0.7 * glyph
+    # A whole (bowed) vertical rule is the label column's: a row rule crosses it with a
+    # short part on its left (x, f'(x), f(x)) and the values' long part on its right.
+    # A curved page edge or the notebook binding, crossed near a rule's end, is not.
+    for v in runs:
+        for h_ in horiz:
+            hy = y_at(h_, (v[0] + v[2]) / 2)
+            vx = x_at(v, hy)
+            if v[1] - m <= hy <= v[3] + m and h_[0] + m <= vx and h_[2] - vx >= 1.5 * (vx - h_[0]):
+                vert.append(v)
+                break
+    if not vert:
+        return []
     rules = [("h", r) for r in horiz] + [("v", r) for r in vert]
     uf = _UnionFind(len(rules))
     crossing: set[int] = set()
@@ -1229,7 +1381,12 @@ def detect_lines(page: Image.Image, params: SegmentationParams | None = None) ->
     text_ink = ink & ~np.any([f.mask for f in figures], axis=0) if figures else ink
     blobs = _take_labels(_blobs(text_ink, glyph), figures, glyph)
     # A table's rules can span 40% of the page too: only lines across most of it are grid here.
-    tables = _find_tables(_figure_ink(full, glyph, TABLE_GRID_SPAN), glyph) if params.classify_regions else []
+    # On a low-resolution page (a screenshot) a rule is 1 px wide and anti-aliased: the
+    # ink mask keeps only pieces of it, so rules are looked for in a fainter mask. Not on
+    # a full-size photo: there the fainter mask is mostly notebook grid.
+    rule_ink = full | _faint_ink(rgb) if glyph < LOW_RES_GLYPH else full
+    rule_ink = _figure_ink(rule_ink, glyph, TABLE_GRID_SPAN)
+    tables = _find_tables(rule_ink, glyph) if params.classify_regions else []
     tables, blobs = _take_table_ink(blobs, tables, glyph)
     if tables:
         text_ink = text_ink.copy()
@@ -1248,10 +1405,17 @@ def detect_lines(page: Image.Image, params: SegmentationParams | None = None) ->
              else _classify(ln, full, glyph) if params.classify_regions else "line"
              for ln in lines]
     inv = 1.0 / scale
-    boxes = _pad(lines, glyph, rgb.shape[1], rgb.shape[0])
+    boxes = _pad(lines, glyph, rgb.shape[1], rgb.shape[0])  # padded against all neighbours
+    # Crossed-out lines are not sent to the VLM at all (the strike is judged on the rule
+    # ink: a pale stroke on a screenshot, grid lines removed).
+    keep = [kind != "line" or not params.drop_struck_out
+            or not _is_struck_out(rule_ink[ln.y0:ln.y1, ln.x0:ln.x1], glyph)
+            for ln, kind in zip(lines, kinds)]
+    if not all(keep):
+        logger.info("Dropping %d crossed-out line(s)", keep.count(False))
     return [DetectedLine(BBox(round(b.x * inv), round(b.y * inv), round(b.w * inv), round(b.h * inv)), kind,
                          by_box[id(ln)].keep(b, glyph) if id(ln) in by_box else None)
-            for ln, b, kind in zip(lines, boxes, kinds)]
+            for ln, b, kind, k in zip(lines, boxes, kinds, keep) if k]
 
 
 def _encode(img: Image.Image, upscale: bool = False) -> bytes:
